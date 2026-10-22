@@ -1,8 +1,8 @@
-# Bluetooth controller in BLE-only mode + NimBLE host stack.
-# CONFIG_BTDM_CTRL_MODE_* are ESP32-classic-only knobs; on C2/C3/C5/C6/
-# C61/H2/H4/S3 they may emit an "unknown symbol" warning at configure
-# time but are otherwise harmless, so this single sdkconfig.defaults
-# stays valid for every supported target.
+# 默认使用 BLE-only 控制器 + NimBLE Host。
+#
+# CONFIG_BTDM_CTRL_MODE_* 这几个选项主要是经典 ESP32 芯片上的控制器模式开关；
+# 在 C2/C3/C5/C6/C61/H2/H4/S3 等芯片上，配置阶段可能提示 unknown symbol，
+# 但通常不会影响构建，因此这一份 sdkconfig.defaults 可以同时服务多个目标芯片。
 CONFIG_BT_ENABLED=y
 CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
 CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
@@ -10,13 +10,17 @@ CONFIG_BTDM_CTRL_MODE_BTDM=n
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
 
-# Negotiate the largest ATT MTU we can; ble_uart_tx auto-fragments to
-# the live MTU so smaller-MTU centrals still work.
+# NimBLE 首选 ATT MTU 设置为 512。
+#
+# MTU 越大，一次 GATT 传输能携带的数据通常越多，可以减少分片次数、提高吞吐量。
+# 实际连接时仍要和 Central 协商最终 MTU；如果对方只支持较小 MTU，
+# ble_uart_tx() 会根据实际 MTU 自动分片，因此依然可以正常工作。
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
 
-# LE Secure Connections + persistent bond store. The example defaults to
-# encrypted operation (ble_uart_config_t::encrypted=true) and stores LTK
-# in NVS so a previously-paired peer reconnects without re-prompting for
-# the passkey.
+# 开启 LE Secure Connections，并把 Bond 信息持久化到 NVS。
+#
+# main.c 中默认配置 `.encrypted = true`，所以 BLE UART 默认走加密通信。
+# 第一次配对成功后，LTK 等长期密钥会保存到 NVS；
+# 同一个设备下次重新连接时可以复用 Bond 信息，而不必每次都重新输入 Passkey。
 CONFIG_BT_NIMBLE_SM_SC=y
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
