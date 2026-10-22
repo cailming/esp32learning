@@ -1,0 +1,35 @@
+首先看环境有没有装好
+idf.py --version
+
+第一步：连接开发板确认串口
+(venv) bash-3.2$ ls /dev/cu.*
+/dev/cu.BLTH			/dev/cu.usbserial-0001
+
+第二步：设置目标芯片并配置项目
+idf.py set-target esp32c3  # 请替换为你的实际芯片型号
+
+
+第三步：编译、烧录并监控
+
+idf.py -p /dev/cu.usbserial-0001  flash monitor
+# 请将 /dev/cu.usbserial-XXXX 替换为你上一步查到的实际串口名。
+
+
+第四步：退出监视窗口
+正常退出串口监视器
+按 Ctrl + ]（同时按 Control 和右方括号 ]）
+
+
+项目的路径发生转移以后使用下面的命令清理然后再编译
+idf.py fullclean
+idf.py build flash monitor
+
+ESP32 系统路径
+cp -r $IDF_PATH/examples/get-started/hello_world .
+
+
+如果存在【main/Kconfig.projbuild】文件，一般需要在编译前进行配置
+执行：下面的命令进行配置
+idf.py menuconfig
+完成配置后【按 Esc 键】返回，并按对话框操作退出
+
