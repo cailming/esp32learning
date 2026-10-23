@@ -6,7 +6,7 @@ idf.py --version
 /dev/cu.BLTH			/dev/cu.usbserial-0001
 
 第二步：设置目标芯片并配置项目
-idf.py set-target esp32c3  # 请替换为你的实际芯片型号
+idf.py set-target esp32s3  # 请替换为你的实际芯片型号
 
 
 第三步：编译、烧录并监控
