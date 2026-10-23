@@ -97,6 +97,16 @@
 
 通过条件：能稳定听到两种不同音高，串口打印 `SPEAKER TEST PASS`。
 
+### 4. all_devices_test
+
+目标：Camera + MIC(I2S0 RX) + Speaker(I2S1 TX) 三套设备同时并行运行，验证 GPIO、DMA、I2S、内存和任务资源是否存在冲突。
+
+### 5. camera_boot_http_test
+
+目标：每按一次板载 BOOT(GPIO0)，拍一张 JPEG；ESP32-S3-CAM 自己创建 Wi-Fi 热点，电脑浏览器访问 `http://192.168.4.1` 自动显示最新照片。
+
+该测试不要求拆除 MIC 或 Speaker 接线。
+
 ## 推荐测试顺序
 
 ```text
@@ -107,9 +117,11 @@
     +--> mic_test
     |
     +--> speaker_test
+    |
+    +--> all_devices_test
+    |
+    +--> camera_boot_http_test
 ```
-
-三个单项都通过后，再继续做 `mic + speaker` 回环测试和 `camera + mic + speaker` 综合测试。
 
 ## 编译、烧录、监控
 
