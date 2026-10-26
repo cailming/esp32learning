@@ -2,12 +2,11 @@
 # 真实相机快门 WAV
 # -----------------------------------------------------------------------------
 #
-# GitHub Connector 当前只适合直接提交文本文件，因此这里把 WAV 作为构建资源处理：
-# 第一次配置工程时，从固定 commit 下载 Mozilla/Firefox DevTools 使用的 shutter.wav，
-# 然后通过 EMBED_FILES 原样打进 ESP32 固件。
+# 第一次配置工程时，从固定 commit 下载 Mozilla / Firefox DevTools 使用的
+# shutter.wav，然后通过 EMBED_FILES 原样打进 ESP32 固件。
 #
-# 固定 commit 的目的是保证以后重新编译时拿到完全相同的声音文件。
-# 该资源来自 Mozilla gecko-dev，源码目录采用 MPL-2.0。
+# 固定 commit 的目的是保证以后重新编译时拿到同一个声音文件。
+# 资源说明见 sounds/README.md。
 #
 set(SHUTTER_SOUND_DIR "${CMAKE_CURRENT_LIST_DIR}/sounds")
 set(SHUTTER_SOUND_FILE "${SHUTTER_SOUND_DIR}/shutter.wav")
