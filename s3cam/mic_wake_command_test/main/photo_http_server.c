@@ -7,6 +7,7 @@
 #include "camera_capture.h"
 #include "esp_check.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -50,6 +51,17 @@ static uint32_t jpeg_fingerprint(const uint8_t *data, size_t size)
     return hash;
 }
 
+static void log_memory(const char *stage)
+{
+    ESP_LOGI(TAG,
+             "MEM %s: internal=%u, largest_internal=%u, dma=%u, psram=%u bytes",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+}
+
 static esp_err_t init_nvs_for_wifi(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -85,8 +97,24 @@ static esp_err_t start_wifi_ap(void)
         return ESP_FAIL;
     }
 
+    /*
+     * Wi-Fi 的静态 RX buffer 主要必须从内部 RAM / DMA-capable RAM 申请。
+     * 如果这里 internal / largest_internal 太低，就会出现：
+     *   Expected to init 10 rx buffer, actual is 9
+     *   esp_wifi_init failed -> ESP_ERR_NO_MEM
+     */
+    log_memory("before esp_wifi_init");
+
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_cfg), TAG, "esp_wifi_init failed");
+    err = esp_wifi_init(&init_cfg);
+    if (err != ESP_OK) {
+        log_memory("after esp_wifi_init FAILED");
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s (0x%x)",
+                 esp_err_to_name(err), (unsigned)err);
+        return err;
+    }
+
+    log_memory("after esp_wifi_init OK");
 
     wifi_config_t wifi_config = {0};
 
