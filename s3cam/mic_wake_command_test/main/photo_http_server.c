@@ -27,17 +27,28 @@ static const char *TAG = "photo_http";
  *
  * 为了避免不同 ESP-IDF 版本对“带子目录的嵌入资源”生成不同 linker symbol，
  * index.html 和 shutter.wav 一样都放在组件根目录。
- *
- * 因此链接器符号固定为：
- *
- *   _binary_index_html_start
- *
- * EMBED_TXTFILES 会在文本末尾自动追加 '\0'，可以直接作为 C 字符串发送。
  */
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 
 static bool s_started = false;
 static httpd_handle_t s_server = NULL;
+
+/* HTTP 端再独立算一次 JPEG 指纹，用来核对复制出来的数据是否和 Camera 保存的一致。 */
+static uint32_t jpeg_fingerprint(const uint8_t *data, size_t size)
+{
+    uint32_t hash = 2166136261u;
+
+    if (data == NULL) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
 
 static esp_err_t init_nvs_for_wifi(void)
 {
@@ -159,8 +170,11 @@ static esp_err_t photo_handler(httpd_req_t *req)
     uint8_t *jpeg_copy = NULL;
     camera_photo_info_t info = {0};
 
+    ESP_LOGI(TAG, "HTTP /photo.jpg: request received");
+
     esp_err_t err = camera_capture_copy_latest(&jpeg_copy, &info);
     if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "HTTP /photo.jpg: no photo available yet");
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_set_type(req, "text/plain; charset=utf-8");
         return httpd_resp_sendstr(req,
@@ -168,29 +182,56 @@ static esp_err_t photo_handler(httpd_req_t *req)
     }
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Copy latest photo failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG,
+                 "HTTP /photo.jpg: copy latest failed: %s",
+                 esp_err_to_name(err));
         httpd_resp_send_err(req,
                             HTTPD_500_INTERNAL_SERVER_ERROR,
                             "Failed to copy latest photo");
         return err;
     }
 
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req,
-                       "Cache-Control",
-                       "no-store, no-cache, must-revalidate");
-    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    const uint32_t copy_fp = jpeg_fingerprint(jpeg_copy, info.jpeg_size);
 
     ESP_LOGI(TAG,
-             "HTTP photo -> #%lu %ux%u %u bytes",
+             "HTTP /photo.jpg: prepared #%lu %ux%u %u bytes, stored_fp=%08lx copy_fp=%08lx",
              (unsigned long)info.sequence,
              (unsigned)info.width,
              (unsigned)info.height,
-             (unsigned)info.jpeg_size);
+             (unsigned)info.jpeg_size,
+             (unsigned long)info.fingerprint,
+             (unsigned long)copy_fp);
+
+    if (copy_fp != info.fingerprint) {
+        ESP_LOGE(TAG,
+                 "HTTP /photo.jpg: FINGERPRINT MISMATCH! stored=%08lx copy=%08lx",
+                 (unsigned long)info.fingerprint,
+                 (unsigned long)copy_fp);
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req,
+                       "Cache-Control",
+                       "no-store, no-cache, must-revalidate, max-age=0");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
 
     err = httpd_resp_send(req,
                           (const char *)jpeg_copy,
                           info.jpeg_size);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "HTTP /photo.jpg: SEND OK #%lu fp=%08lx",
+                 (unsigned long)info.sequence,
+                 (unsigned long)copy_fp);
+    } else {
+        ESP_LOGE(TAG,
+                 "HTTP /photo.jpg: SEND FAILED #%lu fp=%08lx err=%s",
+                 (unsigned long)info.sequence,
+                 (unsigned long)copy_fp,
+                 esp_err_to_name(err));
+    }
 
     free(jpeg_copy);
     return err;
