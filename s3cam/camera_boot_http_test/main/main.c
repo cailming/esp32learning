@@ -1,12 +1,19 @@
 /*
- * ESP32-S3-CAM：BOOT 按键拍照 + 浏览器查看最新照片
+ * ESP32-S3-CAM：BOOT 按键拍照 + 浏览器查看最新照片 + MJPEG 实时视频预览
  *
  * 使用方式：
  * 1. ESP32-S3-CAM 上电后会创建 Wi-Fi 热点：S3CAM-Photo
  * 2. 电脑连接该热点，密码：12345678
  * 3. 浏览器打开：http://192.168.4.1
- * 4. 每按一次板载 BOOT 按钮（GPIO0），摄像头拍一张 JPEG
- * 5. 网页会自动检测新照片并刷新显示
+ * 4. 页面中会直接显示实时视频预览
+ * 5. 每按一次板载 BOOT 按钮（GPIO0），摄像头额外拍一张 JPEG，页面下方显示最新照片
+ * 6. 实时视频流也可以直接访问：http://192.168.4.1:81/video
+ *
+ * 为什么视频流使用 81 端口：
+ * - MJPEG 是一个长期保持连接的 HTTP 请求；
+ * - ESP-IDF 的 HTTP handler 是同步执行的，若把无限循环的视频 handler 放在 80 端口，
+ *   会影响同一个 server 上的 /、/status、/photo.jpg 等普通请求；
+ * - 因此 80 端口负责网页和照片 API，81 端口专门负责 /video 实时视频流。
  *
  * 注意：
  * - 麦克风、MAX98357A、喇叭可以继续保持原来的物理接线；
@@ -68,14 +75,38 @@ static const char *TAG = "boot_photo";
 #define AP_PASSWORD "12345678"
 #define AP_CHANNEL  1
 
-/* -------------------- 最新一张 JPEG 的内存缓存 -------------------- */
+/* -------------------- HTTP / MJPEG -------------------- */
+#define STREAM_PORT 81
+#define PART_BOUNDARY "123456789000000000000987654321"
+
+static const char *STREAM_CONTENT_TYPE =
+    "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY =
+    "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART =
+    "Content-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n";
+
+/* -------------------- 最新一张 BOOT 拍照 JPEG 的内存缓存 -------------------- */
 static uint8_t *s_latest_jpeg = NULL;
 static size_t s_latest_jpeg_len = 0;
 static uint32_t s_photo_count = 0;
-static SemaphoreHandle_t s_photo_mutex = NULL;
 
 /*
- * 网页本身很简单：
+ * s_photo_mutex：保护 s_latest_jpeg / s_latest_jpeg_len / s_photo_count。
+ * s_camera_mutex：保护真正的摄像头 framebuffer 获取过程。
+ *
+ * 为什么需要两个锁？
+ * 1. BOOT 拍照和 /video 视频流都会调用 esp_camera_fb_get()；
+ * 2. 两个任务不能同时抢同一个 Camera framebuffer；
+ * 3. 但“最新照片缓存”和“摄像头硬件”又是两类不同资源，所以分开保护。
+ */
+static SemaphoreHandle_t s_photo_mutex = NULL;
+static SemaphoreHandle_t s_camera_mutex = NULL;
+
+/*
+ * 网页：
+ * - 上方 <img> 直接连接 81 端口的 /video，显示 MJPEG 实时预览；
+ * - 下方仍保留 BOOT 拍照结果；
  * - 每 500ms 请求一次 /status；
  * - 如果 photo_count 变化，则重新请求 /photo.jpg；
  * - URL 后加时间戳，避免浏览器缓存旧照片。
@@ -84,18 +115,28 @@ static const char s_index_html[] =
     "<!doctype html>"
     "<html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ESP32-S3-CAM BOOT Photo</title>"
+    "<title>ESP32-S3-CAM Camera Test</title>"
     "<style>"
     "body{font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;margin:24px;background:#f5f5f5;color:#222;}"
     ".card{max-width:720px;margin:auto;background:white;padding:20px;border-radius:14px;box-shadow:0 2px 12px #0002;}"
-    "img{width:100%;height:auto;border-radius:10px;background:#ddd;margin-top:14px;}"
+    "img{width:100%;height:auto;border-radius:10px;background:#ddd;margin-top:10px;}"
     ".hint{color:#555;line-height:1.6;}"
     ".status{font-weight:600;margin-top:12px;}"
+    ".section{margin-top:22px;padding-top:18px;border-top:1px solid #ddd;}"
+    "code{background:#eee;padding:2px 5px;border-radius:4px;}"
     "</style></head><body><div class='card'>"
-    "<h2>ESP32-S3-CAM BOOT 拍照测试</h2>"
-    "<div class='hint'>每按一次开发板上的 BOOT 按钮，就拍摄一张照片。网页会自动显示最新照片。</div>"
-    "<div id='status' class='status'>等待第一次拍照...</div>"
-    "<img id='photo' style='display:none'>"
+    "<h2>ESP32-S3-CAM 摄像头测试</h2>"
+    "<div class='hint'>实时视频使用 MJPEG。每按一次开发板 BOOT 按钮，还会额外保存一张最新照片。</div>"
+    "<div class='section'>"
+    "<h3>实时视频预览</h3>"
+    "<div class='hint'>视频 URL：<code>http://192.168.4.1:81/video</code></div>"
+    "<img id='video' src='http://192.168.4.1:81/video' alt='实时视频流'>"
+    "</div>"
+    "<div class='section'>"
+    "<h3>BOOT 拍照</h3>"
+    "<div id='status' class='status'>等待第一次按 BOOT 拍照...</div>"
+    "<img id='photo' style='display:none' alt='最新 BOOT 照片'>"
+    "</div>"
     "</div>"
     "<script>"
     "let lastCount=0;"
@@ -105,7 +146,7 @@ static const char s_index_html[] =
     "  const s=await r.json();"
     "  document.getElementById('status').textContent = s.count>0"
     "    ? ('已拍 '+s.count+' 张，最新 JPEG '+s.bytes+' bytes')"
-    "    : '等待第一次拍照...';"
+    "    : '等待第一次按 BOOT 拍照...';"
     "  if(s.count>0 && s.count!==lastCount){"
     "    lastCount=s.count;"
     "    const img=document.getElementById('photo');"
@@ -140,8 +181,8 @@ static esp_err_t init_camera(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,      /* 320 x 240，先用已验证稳定的配置 */
-        .jpeg_quality = 12,                /* 数字越小质量越高；12 仍然比较节省内存 */
+        .frame_size = FRAMESIZE_QVGA,      /* 320 x 240，先保证实时流稳定 */
+        .jpeg_quality = 12,                /* 数字越小质量越高；12 比较适合当前测试 */
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_DRAM,
         .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
@@ -157,12 +198,20 @@ static esp_err_t init_camera(void)
     return err;
 }
 
+/*
+ * BOOT 按一次，额外抓取一帧 JPEG，并复制到 s_latest_jpeg。
+ *
+ * 注意：实时 /video 也在不断抓帧，所以这里必须先取得 s_camera_mutex。
+ */
 static esp_err_t capture_one_photo(void)
 {
     ESP_LOGI(TAG, "BOOT pressed -> capturing photo...");
 
+    xSemaphoreTake(s_camera_mutex, portMAX_DELAY);
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == NULL) {
+        xSemaphoreGive(s_camera_mutex);
         ESP_LOGE(TAG, "Capture failed: esp_camera_fb_get() returned NULL");
         return ESP_FAIL;
     }
@@ -178,17 +227,19 @@ static esp_err_t capture_one_photo(void)
         ESP_LOGE(TAG, "Capture failed: invalid JPEG frame, format=%d len=%u",
                  (int)fb->format, (unsigned)fb->len);
         esp_camera_fb_return(fb);
+        xSemaphoreGive(s_camera_mutex);
         return ESP_FAIL;
     }
 
     /*
-     * Camera framebuffer 后面必须还给驱动，所以不能直接把 fb->buf 保存下来。
-     * 这里复制一份 JPEG 到普通堆内存，供 HTTP 服务长期读取。
+     * Camera framebuffer 后面必须还给驱动，所以不能长期保存 fb->buf 指针。
+     * 这里复制一份 JPEG 到普通堆内存。
      */
     uint8_t *new_jpeg = malloc(fb->len);
     if (new_jpeg == NULL) {
         ESP_LOGE(TAG, "Capture failed: malloc(%u) failed", (unsigned)fb->len);
         esp_camera_fb_return(fb);
+        xSemaphoreGive(s_camera_mutex);
         return ESP_ERR_NO_MEM;
     }
 
@@ -198,7 +249,9 @@ static esp_err_t capture_one_photo(void)
     unsigned height = fb->height;
 
     esp_camera_fb_return(fb);
+    xSemaphoreGive(s_camera_mutex);
 
+    /* 更新“最新一张 BOOT 照片”缓存。 */
     xSemaphoreTake(s_photo_mutex, portMAX_DELAY);
     free(s_latest_jpeg);
     s_latest_jpeg = new_jpeg;
@@ -208,7 +261,7 @@ static esp_err_t capture_one_photo(void)
     xSemaphoreGive(s_photo_mutex);
 
     ESP_LOGI(TAG, "PHOTO #" PRIu32 " OK: %ux%u, %u bytes", count, width, height, (unsigned)new_len);
-    ESP_LOGI(TAG, "电脑浏览器打开/保持 http://192.168.4.1 ，网页会自动刷新");
+    ESP_LOGI(TAG, "网页会自动刷新 BOOT 拍照结果；实时视频仍继续运行");
 
     return ESP_OK;
 }
@@ -254,6 +307,8 @@ static void boot_button_task(void *arg)
     }
 }
 
+/* -------------------- 80 端口：网页 / 状态 / BOOT 照片 -------------------- */
+
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
@@ -296,16 +351,162 @@ static esp_err_t photo_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
 
     /*
-     * 发送期间保持互斥锁，避免 BOOT 拍新照片时把当前 JPEG 内存替换掉。
-     * QVGA JPEG 很小，这个阻塞时间通常很短。
+     * 发送期间保持照片缓存锁，避免 BOOT 拍新照片时释放当前 JPEG 内存。
+     * QVGA JPEG 很小，所以这个阻塞通常很短。
      */
     esp_err_t err = httpd_resp_send(req, (const char *)s_latest_jpeg, s_latest_jpeg_len);
     xSemaphoreGive(s_photo_mutex);
     return err;
 }
 
+/* -------------------- 81 端口：MJPEG 实时视频 -------------------- */
+
+/*
+ * /video handler 的工作方式：
+ *
+ *   HTTP response
+ *       |
+ *       +-- JPEG frame #1
+ *       +-- JPEG frame #2
+ *       +-- JPEG frame #3
+ *       +-- ...
+ *
+ * 每个 JPEG 之间用 multipart boundary 分隔。
+ * 浏览器把这个长连接当作 MJPEG 视频来显示。
+ */
+static esp_err_t video_handler(httpd_req_t *req)
+{
+    esp_err_t res = httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    ESP_LOGI(TAG, "MJPEG client connected: /video");
+
+    /*
+     * frame_copy 是视频 handler 自己的缓存。
+     * 它会尽量复用，只有当新 JPEG 比现有容量更大时才 realloc。
+     *
+     * 这样做的好处：
+     * - Camera framebuffer 只在 memcpy 的短时间内被占用；
+     * - framebuffer 很快归还给 Camera；
+     * - 后续 Wi-Fi 发送即使较慢，也不会长时间锁住 Camera；
+     * - BOOT 拍照可以在视频帧之间获得 Camera 使用权。
+     */
+    uint8_t *frame_copy = NULL;
+    size_t frame_capacity = 0;
+    char part_header[96];
+
+    while (1) {
+        size_t frame_len = 0;
+
+        xSemaphoreTake(s_camera_mutex, portMAX_DELAY);
+        camera_fb_t *fb = esp_camera_fb_get();
+
+        if (fb == NULL) {
+            xSemaphoreGive(s_camera_mutex);
+            ESP_LOGE(TAG, "Video capture failed: esp_camera_fb_get() returned NULL");
+            res = ESP_FAIL;
+            break;
+        }
+
+        bool valid_jpeg =
+            fb->format == PIXFORMAT_JPEG &&
+            fb->buf != NULL &&
+            fb->len >= 4 &&
+            fb->buf[0] == 0xFF &&
+            fb->buf[1] == 0xD8;
+
+        if (!valid_jpeg) {
+            ESP_LOGW(TAG, "Video skipped invalid JPEG frame: format=%d len=%u",
+                     (int)fb->format, (unsigned)fb->len);
+            esp_camera_fb_return(fb);
+            xSemaphoreGive(s_camera_mutex);
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (fb->len > frame_capacity) {
+            uint8_t *new_buffer = realloc(frame_copy, fb->len);
+            if (new_buffer == NULL) {
+                ESP_LOGE(TAG, "Video realloc(%u) failed", (unsigned)fb->len);
+                esp_camera_fb_return(fb);
+                xSemaphoreGive(s_camera_mutex);
+                res = ESP_ERR_NO_MEM;
+                break;
+            }
+            frame_copy = new_buffer;
+            frame_capacity = fb->len;
+        }
+
+        memcpy(frame_copy, fb->buf, fb->len);
+        frame_len = fb->len;
+
+        /* 尽快归还 Camera framebuffer，并释放 Camera 锁。 */
+        esp_camera_fb_return(fb);
+        xSemaphoreGive(s_camera_mutex);
+
+        /* 发送 multipart boundary。 */
+        res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, HTTPD_RESP_USE_STRLEN);
+        if (res != ESP_OK) {
+            break;
+        }
+
+        /* 告诉浏览器接下来这一段是 JPEG，以及 JPEG 的字节数。 */
+        int header_len = snprintf(part_header, sizeof(part_header), STREAM_PART, frame_len);
+        if (header_len < 0 || header_len >= (int)sizeof(part_header)) {
+            ESP_LOGE(TAG, "MJPEG part header too long");
+            res = ESP_FAIL;
+            break;
+        }
+
+        res = httpd_resp_send_chunk(req, part_header, header_len);
+        if (res != ESP_OK) {
+            break;
+        }
+
+        /* 真正发送这一帧 JPEG。 */
+        res = httpd_resp_send_chunk(req, (const char *)frame_copy, frame_len);
+        if (res != ESP_OK) {
+            break;
+        }
+
+        /*
+         * 稍微让出 CPU，避免在 QVGA 下无限制高速抓帧。
+         * 实际帧率还取决于 OV3660、JPEG 编码和 Wi-Fi 吞吐。
+         */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    free(frame_copy);
+
+    /* 正常结束 chunked response；客户端断开时这里也可能返回错误，可忽略。 */
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    ESP_LOGI(TAG, "MJPEG client disconnected: /video, result=%s", esp_err_to_name(res));
+    return res;
+}
+
+/*
+ * 同时启动两个 HTTP server：
+ *
+ * 80 端口：
+ *   /            -> 网页
+ *   /status      -> BOOT 拍照状态 JSON
+ *   /photo.jpg   -> 最近一张 BOOT 照片
+ *
+ * 81 端口：
+ *   /video       -> MJPEG 实时视频流
+ *
+ * 第二个 server 的 ctrl_port 也必须换一个值，否则两个 HTTP server 的内部控制端口会冲突。
+ */
 static void start_http_server(void)
 {
+    /* ---------- 普通 Web Server：80 ---------- */
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
     config.max_uri_handlers = 8;
@@ -338,7 +539,28 @@ static void start_http_server(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &status_uri));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &photo_uri));
 
-    ESP_LOGI(TAG, "HTTP server started: http://192.168.4.1");
+    ESP_LOGI(TAG, "Web server started : http://192.168.4.1");
+
+    /* ---------- MJPEG Stream Server：81 ---------- */
+    httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
+    stream_config.server_port = STREAM_PORT;
+    stream_config.ctrl_port += 1;   /* 避免与 80 端口 server 的内部 ctrl_port 冲突 */
+    stream_config.stack_size = 8192;
+    stream_config.max_uri_handlers = 4;
+
+    httpd_handle_t stream_server = NULL;
+    ESP_ERROR_CHECK(httpd_start(&stream_server, &stream_config));
+
+    httpd_uri_t video_uri = {
+        .uri = "/video",
+        .method = HTTP_GET,
+        .handler = video_handler,
+        .user_ctx = NULL,
+    };
+
+    ESP_ERROR_CHECK(httpd_register_uri_handler(stream_server, &video_uri));
+
+    ESP_LOGI(TAG, "Video server started: http://192.168.4.1:%d/video", STREAM_PORT);
 }
 
 static void start_wifi_ap(void)
@@ -367,14 +589,16 @@ static void start_wifi_ap(void)
     ESP_LOGI(TAG, "Wi-Fi AP started");
     ESP_LOGI(TAG, "SSID     : %s", AP_SSID);
     ESP_LOGI(TAG, "Password : %s", AP_PASSWORD);
-    ESP_LOGI(TAG, "Browser  : http://192.168.4.1");
+    ESP_LOGI(TAG, "Web      : http://192.168.4.1");
+    ESP_LOGI(TAG, "Video    : http://192.168.4.1:%d/video", STREAM_PORT);
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "ESP32-S3-CAM BOOT BUTTON PHOTO TEST");
+    ESP_LOGI(TAG, "ESP32-S3-CAM BOOT PHOTO + MJPEG VIDEO TEST");
     ESP_LOGI(TAG, "BOOT(GPIO0) -> capture JPEG -> browser display");
+    ESP_LOGI(TAG, "MJPEG video -> http://192.168.4.1:%d/video", STREAM_PORT);
     ESP_LOGI(TAG, "MIC / MAX98357A / Speaker 保持接线，不需要拔除");
     ESP_LOGI(TAG, "====================================================");
 
@@ -387,8 +611,9 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     s_photo_mutex = xSemaphoreCreateMutex();
-    if (s_photo_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create photo mutex");
+    s_camera_mutex = xSemaphoreCreateMutex();
+    if (s_photo_mutex == NULL || s_camera_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex");
         return;
     }
 
@@ -401,8 +626,9 @@ void app_main(void)
     ESP_LOGI(TAG, "READY");
     ESP_LOGI(TAG, "1) 电脑连接 Wi-Fi: %s", AP_SSID);
     ESP_LOGI(TAG, "2) 密码: %s", AP_PASSWORD);
-    ESP_LOGI(TAG, "3) 浏览器打开: http://192.168.4.1");
-    ESP_LOGI(TAG, "4) 每短按一次 BOOT，就拍摄一张新照片");
+    ESP_LOGI(TAG, "3) 浏览器主页: http://192.168.4.1");
+    ESP_LOGI(TAG, "4) 实时视频URL: http://192.168.4.1:%d/video", STREAM_PORT);
+    ESP_LOGI(TAG, "5) 每短按一次 BOOT，还会保存一张最新照片");
     ESP_LOGI(TAG, "====================================================");
 
     xTaskCreate(boot_button_task, "boot_button_task", 4096, NULL, 5, NULL);
