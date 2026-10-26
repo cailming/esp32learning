@@ -19,6 +19,8 @@
  *       ↓
  *   拍照成功后播放 shutter.wav
  *       ↓
+ *   Wi-Fi / HTTP 页面自动显示最新照片
+ *       ↓
  *   重新等待“你好小智”
  *
  * 已验证硬件接线：
@@ -63,6 +65,7 @@
 #include "model_path.h"
 
 #include "camera_capture.h"
+#include "photo_http_server.h"
 #include "shutter_wav_player.h"
 
 #if !CONFIG_IDF_TARGET_ESP32S3
@@ -290,7 +293,7 @@ static bool execute_voice_command(int command_id)
                      "ACTION: 照片已经拍摄成功，只是快门音播放失败");
         }
 
-        ESP_LOGI(TAG, "ACTION: 最新 JPEG 已保留在内存中，可供后续 HTTP/上传使用");
+        ESP_LOGI(TAG, "ACTION: 浏览器 http://192.168.4.1/ 会自动显示最新照片");
         ESP_LOGI(TAG, "ACTION: 本次拍照完成，重新等待唤醒词");
         ESP_LOGI(TAG, "====================================================");
         return true;
@@ -659,11 +662,12 @@ static void speech_detect_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "ESP32-S3 VOICE + REAL CAMERA PHOTO + WAV SHUTTER");
+    ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA PHOTO + WAV + WEB VIEW");
     ESP_LOGI(TAG, "Camera  : OV3660 / QVGA JPEG / real capture");
     ESP_LOGI(TAG, "INMP441 : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
     ESP_LOGI(TAG, "Speaker : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
+    ESP_LOGI(TAG, "Web     : S3CAM-Photo -> http://192.168.4.1/");
     ESP_LOGI(TAG, "====================================================");
 
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -672,11 +676,11 @@ void app_main(void)
     if (psram_free == 0) {
         ESP_LOGW(TAG,
                  "当前没有可用 PSRAM；最新 JPEG 会回退到内部内存，"
-                 "WakeNet + MultiNet 也可能受内存限制影响。");
+                 "WakeNet + MultiNet + Wi-Fi 也可能受内存限制影响。");
     }
 
     /*
-     * 先初始化三套硬件能力：
+     * 先初始化核心硬件能力：
      *   Camera：板载 OV3660
      *   I2S0：INMP441 RX
      *   I2S1：MAX98357A TX
@@ -740,4 +744,17 @@ void app_main(void)
         s_running = false;
         return;
     }
+
+    /*
+     * 核心 Camera / ESP-SR 已经就绪后，再启动 Wi-Fi + HTTP。
+     * 网页只查看“最新 JPEG”，不启用 MJPEG 实时视频，减少资源占用。
+     */
+    ESP_ERROR_CHECK(photo_http_server_start());
+
+    ESP_LOGI(TAG, "====================================================");
+    ESP_LOGI(TAG, "SYSTEM READY");
+    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照");
+    ESP_LOGI(TAG, "Wi-Fi : S3CAM-Photo / 12345678");
+    ESP_LOGI(TAG, "Web   : http://192.168.4.1/");
+    ESP_LOGI(TAG, "====================================================");
 }
