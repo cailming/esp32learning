@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ESP32-S3-CAM Camera Test</title>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+            margin: 24px;
+            background: #f5f5f5;
+            color: #222;
+        }
+
+        .card {
+            max-width: 720px;
+            margin: auto;
+            padding: 20px;
+            background: #fff;
+            border-radius: 14px;
+            box-shadow: 0 2px 12px #0002;
+        }
+
+        img {
+            width: 100%;
+            height: auto;
+            margin-top: 10px;
+            background: #ddd;
+            border-radius: 10px;
+        }
+
+        .hint {
+            color: #555;
+            line-height: 1.6;
+        }
+
+        .status {
+            margin-top: 12px;
+            font-weight: 600;
+        }
+
+        .section {
+            margin-top: 22px;
+            padding-top: 18px;
+            border-top: 1px solid #ddd;
+        }
+
+        code {
+            padding: 2px 5px;
+            background: #eee;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+<div class="card">
+    <h2>ESP32-S3-CAM 摄像头测试</h2>
+
+    <div class="hint">
+        实时视频使用 MJPEG。每按一次开发板 BOOT 按钮，还会额外保存一张最新照片。
+    </div>
+
+    <div class="section">
+        <h3>实时视频预览</h3>
+        <div class="hint">
+            视频 URL：<code id="video-url"></code>
+        </div>
+        <img id="video" alt="实时视频流">
+    </div>
+
+    <div class="section">
+        <h3>BOOT 拍照</h3>
+        <div id="status" class="status">等待第一次按 BOOT 拍照...</div>
+        <img id="photo" style="display:none" alt="最新 BOOT 照片">
+    </div>
+</div>
+
+<script>
+    /*
+     * 不把 192.168.4.1 写死在 HTML 中。
+     * 当前 SoftAP 下 location.hostname 是 192.168.4.1；
+     * 以后如果改成连接路由器，页面也可以自动使用新的 IP。
+     */
+    const videoUrl = `http://${location.hostname}:81/video`;
+    document.getElementById('video-url').textContent = videoUrl;
+    document.getElementById('video').src = videoUrl;
+
+    /* 浏览器上一次看到的 BOOT 拍照编号。 */
+    let lastCount = 0;
+
+    /* 每 500ms 查询一次 ESP32 当前拍照状态。 */
+    async function poll() {
+        try {
+            /* 时间戳 + no-store 都用于避免浏览器缓存旧状态。 */
+            const response = await fetch(`/status?ts=${Date.now()}`, {
+                cache: 'no-store'
+            });
+
+            const status = await response.json();
+            const statusElement = document.getElementById('status');
+
+            statusElement.textContent = status.count > 0
+                ? `已拍 ${status.count} 张，最新 JPEG ${status.bytes} bytes`
+                : '等待第一次按 BOOT 拍照...';
+
+            /* photo_count 变化，说明刚刚产生了一张新的 BOOT 静态照片。 */
+            if (status.count > 0 && status.count !== lastCount) {
+                lastCount = status.count;
+
+                const image = document.getElementById('photo');
+
+                /*
+                 * n 和 ts 让 URL 每次都不同，避免浏览器继续显示缓存的旧 JPEG。
+                 */
+                image.src = `/photo.jpg?n=${status.count}&ts=${Date.now()}`;
+                image.style.display = 'block';
+            }
+        } catch (error) {
+            document.getElementById('status').textContent = '与开发板通信失败';
+        }
+    }
+
+    setInterval(poll, 500);
+    poll();
+</script>
+</body>
+</html>
