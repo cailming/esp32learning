@@ -12,18 +12,26 @@ static const char *TAG = "shutter_wav";
 /*
  * 来自：EMBED_FILES "shutter.wav"
  *
- * 为了避免带子目录路径时不同 ESP-IDF 版本的符号命名差异，
- * 当前把 shutter.wav 放在 main 组件根目录，因此符号固定为：
- *
+ * ESP-IDF 会生成：
  *   _binary_shutter_wav_start
  *   _binary_shutter_wav_end
  */
 extern const uint8_t shutter_wav_start[] asm("_binary_shutter_wav_start");
 extern const uint8_t shutter_wav_end[]   asm("_binary_shutter_wav_end");
 
-#define OUTPUT_SAMPLE_RATE 16000U
-#define OUTPUT_FRAMES_PER_BLOCK 128U
-#define OUTPUT_GAIN_PERCENT 70
+/*
+ * 当前真实 shutter.wav 的原始格式是：
+ *   44100 Hz / mono / 16-bit PCM
+ *
+ * Speaker I2S1 也直接工作在 44100 Hz，因此这里完全不做重采样。
+ * 只把 mono 样本复制成 LEFT / RIGHT 两个声道后写给 MAX98357A。
+ *
+ * 这样可以保留真实快门声里的高频瞬态，避免 44.1kHz -> 16kHz
+ * 简单降采样造成的混叠、爆裂和“机关枪”听感。
+ */
+#define SHUTTER_SAMPLE_RATE       44100U
+#define OUTPUT_FRAMES_PER_BLOCK  128U
+#define OUTPUT_GAIN_PERCENT      70
 
 static int16_t s_output[OUTPUT_FRAMES_PER_BLOCK * 2U];
 
@@ -49,7 +57,11 @@ static uint32_t read_le32(const uint8_t *p)
            | ((uint32_t)p[3] << 24);
 }
 
-static bool fourcc_is(const uint8_t *p, const char a, const char b, const char c, const char d)
+static bool fourcc_is(const uint8_t *p,
+                      const char a,
+                      const char b,
+                      const char c,
+                      const char d)
 {
     return p[0] == (uint8_t)a
            && p[1] == (uint8_t)b
@@ -58,8 +70,8 @@ static bool fourcc_is(const uint8_t *p, const char a, const char b, const char c
 }
 
 /*
- * WAV 并不保证 fmt/data chunk 紧挨着，所以这里按 RIFF chunk 逐个扫描。
- * 只接受最适合本项目的标准 PCM：16-bit / mono。
+ * RIFF/WAV 的 fmt/data chunk 不保证紧挨着，因此逐个扫描 chunk。
+ * 当前只支持本项目真正使用的标准 PCM：mono / 16-bit。
  */
 static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
 {
@@ -67,7 +79,8 @@ static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!fourcc_is(data, 'R', 'I', 'F', 'F') || !fourcc_is(data + 8, 'W', 'A', 'V', 'E')) {
+    if (!fourcc_is(data, 'R', 'I', 'F', 'F')
+        || !fourcc_is(data + 8, 'W', 'A', 'V', 'E')) {
         ESP_LOGE(TAG, "Invalid WAV: RIFF/WAVE header not found");
         return ESP_ERR_INVALID_RESPONSE;
     }
@@ -112,7 +125,8 @@ static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
     }
 
     if (info->audio_format != 1) {
-        ESP_LOGE(TAG, "Unsupported WAV format=%u, only PCM(1) is supported",
+        ESP_LOGE(TAG,
+                 "Unsupported WAV format=%u, only PCM(1) is supported",
                  (unsigned)info->audio_format);
         return ESP_ERR_NOT_SUPPORTED;
     }
@@ -125,7 +139,15 @@ static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    if (info->sample_rate == 0 || info->pcm_size < 2) {
+    if (info->sample_rate != SHUTTER_SAMPLE_RATE) {
+        ESP_LOGE(TAG,
+                 "Unexpected WAV sample rate=%u, expected %u Hz",
+                 (unsigned)info->sample_rate,
+                 (unsigned)SHUTTER_SAMPLE_RATE);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (info->pcm_size < 2) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -166,53 +188,28 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
     }
 
     const size_t source_samples = wav.pcm_size / sizeof(int16_t);
-    const size_t output_frames =
-        ((uint64_t)source_samples * OUTPUT_SAMPLE_RATE) / wav.sample_rate;
 
     ESP_LOGI(TAG,
-             "Play embedded WAV: %u Hz mono 16-bit, source=%u samples, output=%u frames",
+             "Play embedded WAV directly: %u Hz mono 16-bit, %u samples",
              (unsigned)wav.sample_rate,
-             (unsigned)source_samples,
-             (unsigned)output_frames);
+             (unsigned)source_samples);
 
-    size_t out_index = 0;
+    size_t source_index = 0;
 
-    while (out_index < output_frames) {
-        size_t frames = output_frames - out_index;
+    while (source_index < source_samples) {
+        size_t frames = source_samples - source_index;
         if (frames > OUTPUT_FRAMES_PER_BLOCK) {
             frames = OUTPUT_FRAMES_PER_BLOCK;
         }
 
         for (size_t i = 0; i < frames; ++i) {
-            const size_t global_out = out_index + i;
+            int16_t sample = apply_gain(
+                pcm16_at(wav.pcm, source_index + i));
 
             /*
-             * 用整数线性插值把源 WAV 重采样到 16kHz。
-             *
-             * source_position = global_out * source_rate / output_rate
+             * WAV 是 mono；MAX98357A 当前使用 stereo framing，
+             * 所以把同一个真实 PCM 样本复制到 LEFT / RIGHT。
              */
-            const uint64_t numerator =
-                (uint64_t)global_out * (uint64_t)wav.sample_rate;
-            size_t source_index = (size_t)(numerator / OUTPUT_SAMPLE_RATE);
-            uint32_t fraction = (uint32_t)(numerator % OUTPUT_SAMPLE_RATE);
-
-            if (source_index >= source_samples) {
-                source_index = source_samples - 1;
-            }
-
-            size_t next_index = source_index + 1;
-            if (next_index >= source_samples) {
-                next_index = source_index;
-            }
-
-            int32_t s0 = pcm16_at(wav.pcm, source_index);
-            int32_t s1 = pcm16_at(wav.pcm, next_index);
-            int32_t mixed =
-                s0 + ((s1 - s0) * (int32_t)fraction) / (int32_t)OUTPUT_SAMPLE_RATE;
-
-            int16_t sample = apply_gain(mixed);
-
-            /* MAX98357A 当前按 stereo framing 发送，左右声道写相同样本。 */
             s_output[i * 2U] = sample;
             s_output[i * 2U + 1U] = sample;
         }
@@ -238,7 +235,7 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
             return ESP_FAIL;
         }
 
-        out_index += frames;
+        source_index += frames;
     }
 
     return ESP_OK;
