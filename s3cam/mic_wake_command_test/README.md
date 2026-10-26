@@ -1,6 +1,6 @@
 # mic_wake_command_test
 
-这个工程用于验证当前 ESP32-S3-CAM + INMP441 的完整离线语音链路：
+这个工程用于验证当前 ESP32-S3-CAM 的离线语音交互链路，并在识别到“拍照”命令后通过 MAX98357A + Speaker 播放相机快门音。
 
 ```text
 INMP441
@@ -17,20 +17,12 @@ MultiNet6 中文命令识别
    ↓
 execute_voice_command()
    ↓
-串口 ACTION 日志 / 状态变化
+“拍照”
+   ↓
+I2S1 TX → MAX98357A → Speaker → “咔嚓”
 ```
 
-## 为什么使用 ESP-SR
-
-ESP32-S3 可以直接运行乐鑫官方 ESP-SR：
-
-- AFE：音频前端；
-- WakeNet：离线唤醒词；
-- MultiNet：离线固定命令词识别。
-
-这个测试不需要 Wi-Fi，也不需要云端 ASR。
-
-当前工程使用：
+## 当前模型
 
 ```text
 ESP-SR ^2.6.0
@@ -39,20 +31,18 @@ WakeNet10 模型：wn10_nihaoxiaozhi
 MultiNet6：中文命令词
 ```
 
-`sdkconfig.defaults` 中对应配置：
+`sdkconfig.defaults`：
 
 ```text
 CONFIG_SR_WN_WN10_NIHAOXIAOZHI=y
 CONFIG_SR_MN_CN_MULTINET6_QUANT=y
 ```
 
-选择较新的 ESP-SR 是因为 2.5.0 起已包含 ESP-IDF 6.1 Kconfig 兼容修复。
-
 ## 硬件接线
 
-保持现有所有硬件完整接线，不需要拔 Camera、MAX98357A 或 Speaker。
+所有模块继续保持现有接线，不需要为了这个测试拔 Camera、MIC 或 Speaker。
 
-本程序只初始化 INMP441：
+### INMP441
 
 | INMP441 | ESP32-S3-CAM |
 | --- | --- |
@@ -63,14 +53,44 @@ CONFIG_SR_MN_CN_MULTINET6_QUANT=y
 | GND | 公共 GND |
 | L/R | 公共 GND |
 
-前面的 `mic_test` 已经确认：
+MIC 使用：
 
 ```text
-LEFT  channel = 有效麦克风数据
-RIGHT channel = 0
+I2S0 / RX
+16kHz
+32-bit stereo framing
+LEFT channel 有效
 ```
 
-## 第一版支持的语音命令
+### MAX98357A
+
+| MAX98357A | ESP32-S3-CAM |
+| --- | --- |
+| BCLK | GPIO14 |
+| LRC | GPIO3 |
+| DIN | GPIO46 |
+| VIN | 5V |
+| GND | 公共 GND |
+
+Speaker：
+
+```text
+红线 -> MAX98357A +
+黑线 -> MAX98357A -
+```
+
+注意：Speaker 黑线不要接 ESP32 GND。
+
+Speaker 使用：
+
+```text
+I2S1 / TX
+16kHz
+16-bit stereo
+LEFT / RIGHT 发送相同数据
+```
+
+## 支持的语音命令
 
 唤醒词：
 
@@ -78,66 +98,92 @@ RIGHT channel = 0
 你好小智
 ```
 
-唤醒成功后直接说中文：
+唤醒后可以说：
 
-| Command ID | 实际说法 | MultiNet 内部拼音 | 测试动作 |
+| Command ID | 实际说法 | MultiNet 拼音 | 动作 |
 | ---: | --- | --- | --- |
-| 1 | 拍照 | pai zhao | `photo_request_count++` |
+| 1 | 拍照 | pai zhao | 拍照请求计数 + 播放“咔嚓”快门音 |
 | 2 | 开始录像 | kai shi lu xiang | `video_recording=true` |
 | 3 | 停止录像 | ting zhi lu xiang | `video_recording=false` |
-| 4 | 打开声音 | da kai sheng yin | `sound_enabled=true` |
-| 5 | 关闭声音 | guan bi sheng yin | `sound_enabled=false` |
+| 4 | 打开声音 | da kai sheng yin | 打开快门音 |
+| 5 | 关闭声音 | guan bi sheng yin | 关闭快门音 |
 | 6 | 状态查询 | zhuang tai cha xun | 打印当前状态 |
-| 7 | 退出语音 | tui chu yu yin | 立即重新等待唤醒词 |
+| 7 | 退出语音 | tui chu yu yin | 重新等待唤醒词 |
 
-这里的“执行”目前是**测试级业务执行**：
-
-- 命令已经由 MultiNet 识别成 `command_id`；
-- `execute_voice_command()` 根据 ID 进入不同 `case`；
-- 更新内存状态并输出明确的 `ACTION` 日志。
-
-这一步通过以后，可以把对应 case 替换成真实动作，例如：
+Camera 目前还没有在这个工程里真正初始化，因此“拍照”现在的动作是：
 
 ```text
-“拍照”
+识别“拍照”
    ↓
-调用 Camera capture_one_photo()
-
-“打开声音”
+photo_request_count++
    ↓
-启用 MAX98357A / 播放提示音
+播放真实 Speaker 快门音
 ```
 
-## Flash / PSRAM
-
-当前板子前面的启动日志已经检测到：
+后续把 Camera 合进来以后，建议调整成：
 
 ```text
-Flash physical size: 16MB
+识别“拍照”
+   ↓
+Camera 真正拍照成功
+   ↓
+播放“咔嚓”
 ```
 
-因此本工程配置为 16MB Flash，并专门创建 `model` 分区存放 ESP-SR 模型。
+这样声音代表“照片已经成功拍下”。
 
-完整 WakeNet + MultiNet 对内存要求比普通 MIC 测试高很多，官方 ESP32-S3 speech-command 示例通常启用 PSRAM。本工程也暂按 ESP32-S3 Octal PSRAM 配置。
+## 快门音实现
 
-如果本板实际 PSRAM 类型不同，启动时可能在 PSRAM 初始化阶段报错。**遇到这种情况不要拆任何硬件线**，把启动日志发回来，再根据实际模组修改 PSRAM 配置。
-
-## 分区表
-
-`partitions.csv` 中包含：
+当前没有使用 WAV 文件，而是在代码中实时合成两个很短的衰减噪声脉冲：
 
 ```text
-factory app : 2MB
-model       : 6MB
+“咔”  24ms 较强脉冲
+  ↓
+14ms 间隔
+  ↓
+“嚓”  48ms 较弱脉冲
+  ↓
+60ms 静音尾部
 ```
 
-ESP-SR 会把选中的 WakeNet / MultiNet 模型打包并烧录到 `model` 分区。
+这样不需要 SPIFFS / LittleFS，也不需要额外音频文件。
+
+快门音音量参数位于 `main.c`：
+
+```c
+#define SHUTTER_CLICK_AMPLITUDE 4000
+#define SHUTTER_CLACK_AMPLITUDE 2800
+```
+
+如果觉得太响，可以减小；如果太轻，可以适当增大。
+
+## 避免 Speaker 声音干扰语音识别
+
+当前 AFE 配置是单麦克风：
+
+```text
+input_format = "M"
+```
+
+没有 Speaker playback reference，因此暂时没有使用真正的 AEC 回声消除。
+
+播放快门音时采用一个简单保护：
+
+```text
+Speaker 播放期间
+   ↓
+INMP441 仍持续从 I2S0 读取
+   ↓
+但 audio_feed_task 向 ESP-SR AFE 喂 0
+   ↓
+快门声不会再次进入 WakeNet / MultiNet
+```
+
+播放结束后再自动恢复正常 MIC 数据。
 
 ## 编译
 
-第一次编译需要下载 ESP-SR Managed Component，所以电脑需要能访问 ESP Component Registry。
-
-切换 WakeNet 模型以后，建议删除旧的 `build` 和 `sdkconfig`，确保新的模型选择真正生效：
+切换过 WakeNet 模型后，建议干净编译：
 
 ```bash
 cd s3cam/mic_wake_command_test
@@ -149,13 +195,7 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
-如果新终端里又出现：
-
-```text
-xtensa-esp32s3-elf-gcc not found
-```
-
-先恢复已经确认可用的 ESP-IDF 6.1 环境：
+如果新终端缺少 ESP-IDF 6.1 环境：
 
 ```bash
 source /Users/apple/.espressif/tools/activate_idf_v6.1.sh
@@ -168,38 +208,20 @@ export PATH="/Users/apple/.espressif/tools/tools/xtensa-esp-elf/esp-15.2.0_20251
 idf.py -p /dev/cu.usbserial-0001 flash monitor
 ```
 
-## 正常启动时重点观察
-
-程序会依次完成：
+启动后应看到：
 
 ```text
-1. I2S0 / INMP441 初始化
-2. ESP-SR model partition 加载
-3. AFE 创建
-4. audio_feed task 启动
-5. speech_detect task 启动
-6. 等待唤醒词
-```
-
-最终应看到类似：
-
-```text
+MIC I2S ready: 16kHz, BCLK=42, WS=41, DIN=1, LEFT channel
+Speaker I2S ready: 16kHz, BCLK=14, LRC=3, DOUT=46
 READY: 等待唤醒词 -> 你好小智
+拍照命令会通过 MAX98357A 播放快门音
 ```
 
-同时会周期性看到：
-
-```text
-MIC alive: peak=xxxx
-```
-
-说明 I2S 麦克风数据还在持续进入 AFE。
-
-## 测试步骤
+## 推荐测试步骤
 
 ### 1. 唤醒
 
-对着麦克风说：
+说：
 
 ```text
 你好小智
@@ -209,115 +231,88 @@ MIC alive: peak=xxxx
 
 ```text
 WAKE WORD DETECTED: 你好小智
-现在请说命令，例如：拍照 / 开始录像 / 状态查询
 ```
 
-### 2. 说命令
+### 2. 拍照 + 快门音
 
-例如说：
+说：
 
 ```text
 拍照
 ```
 
-期望看到类似：
+期望串口：
 
 ```text
-TOP1: command_id=1 ...
 COMMAND DETECTED: id=1, name=拍照
 ACTION: 拍照请求 #1
+SHUTTER SOUND: 咔嚓
 ```
 
-再说：
+同时 Speaker 应实际听到一个很短的“咔嚓”声音。
+
+### 3. 测试关闭声音
+
+说：
 
 ```text
-开始录像
-状态查询
+关闭声音
+拍照
 ```
 
-期望：
+第二次“拍照”仍应识别成功并增加计数，但 Speaker 不播放：
 
 ```text
-ACTION: 录像状态 -> START
-ACTION: STATUS video=ON, sound=ON, photo_requests=1
+SHUTTER SOUND: 当前声音已关闭，跳过播放
 ```
 
-### 3. 超时 / 退出
-
-唤醒后约 6 秒没有有效命令，MultiNet 会超时并重新等待唤醒词。
-
-也可以直接说：
+然后说：
 
 ```text
-退出语音
+打开声音
+拍照
 ```
 
-立即回到：
+快门音恢复。
+
+## Flash / PSRAM
+
+当前工程按：
 
 ```text
-重新等待唤醒词：你好小智
+Flash：16MB
+WakeNet10 + MultiNet6
+PSRAM：启用
 ```
 
-## 关于音频格式
-
-INMP441 当前输出：
-
-```text
-16kHz
-32-bit slot
-stereo I2S framing
-LEFT channel 有效
-```
-
-ESP-SR MultiNet 要求：
-
-```text
-16kHz
-16-bit
-mono
-```
-
-因此 `audio_feed_task()` 会把 LEFT `int32_t` 样本转换为 `int16_t`，再送入 AFE。
-
-当前转换参数：
-
-```c
-#define MIC_SAMPLE_SHIFT 14
-```
-
-如果后面发现：
-
-- `MIC alive peak` 经常接近 32767：说明可能太响/削顶，可改成 15 或 16；
-- `peak` 长期非常小：可以尝试 13；
-
-但第一轮测试先不要调整，先看实际日志。
+`partitions.csv` 中包含独立 `model` 分区，用来存放 ESP-SR 模型。
 
 ## 当前测试边界
 
-这个工程第一阶段只验证：
+目前已经覆盖：
 
 ```text
 麦克风采集
-  +
-唤醒词
-  +
-命令词
-  +
++
+WakeNet10 唤醒
++
+MultiNet6 命令识别
++
 命令 ID 分发
++
+MAX98357A / Speaker 快门音
 ```
 
-Camera / Speaker 仍保持物理连接，但程序暂时不初始化它们。
+Camera 仍然保持物理连接，但这个工程暂未初始化 Camera。
 
-等这个测试通过后，再把它和已经通过的 Camera + Speaker 代码合起来，形成真正的：
+下一步可以把已经验证过的 Camera 代码合进来，形成真正的：
 
 ```text
 “你好小智”
    ↓
 “拍照”
    ↓
-摄像头实际拍照
-
-“打开声音”
+Camera 拍照
    ↓
-喇叭实际反馈
+“咔嚓”
 ```
