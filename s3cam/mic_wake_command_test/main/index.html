@@ -63,15 +63,16 @@
 <script>
     /*
      * displayedSequence：浏览器已经真正显示成功的照片序号。
-     * pendingSequence  ：当前正在下载的照片序号。
+     * pendingSequence  ：当前正在下载/解码的照片序号。
      * latestSequence   ：/status 最近一次返回的最新照片序号。
      *
      * 旧版代码在 image.src 真正加载成功前就更新 lastSequence。
      * 一旦某次 /photo.jpg 请求失败，后续轮询会误以为该序号已经显示过，
      * 只能等下一次拍照 sequence 改变才再次请求，于是用户会感觉需要拍两三次。
      *
-     * 当前实现只有 JPEG 完整 fetch 成功并显示后才更新 displayedSequence；
-     * 请求失败则保持 displayedSequence 不变，下一轮 500ms 轮询自动重试同一张。
+     * 当前实现只有 JPEG 完整 fetch 成功并完成浏览器解码后，才更新
+     * displayedSequence；失败则保持 displayedSequence 不变，下一轮 500ms
+     * 轮询自动重试同一张照片。
      */
     let displayedSequence = 0;
     let pendingSequence = 0;
@@ -108,10 +109,13 @@
             }
 
             /*
-             * 如果下载过程中又拍了更新的照片，旧请求即使成功也不要覆盖新照片。
-             * 下一轮 /status 会继续拉取最新 sequence。
+             * 如果下载过程中又拍了更新的照片，旧请求不要覆盖新照片。
+             * 清掉 pending 后，下一轮 /status 会继续拉取最新 sequence。
              */
             if (sequence !== latestSequence) {
+                if (pendingSequence === sequence) {
+                    pendingSequence = 0;
+                }
                 return;
             }
 
@@ -125,23 +129,35 @@
 
                 currentObjectUrl = newObjectUrl;
                 displayedSequence = sequence;
+
+                if (pendingSequence === sequence) {
+                    pendingSequence = 0;
+                }
+
                 imageElement.style.display = 'block';
                 statusElement.textContent = `照片 #${sequence} 已显示`;
             };
 
             imageElement.onerror = () => {
                 URL.revokeObjectURL(newObjectUrl);
-                statusElement.textContent = `照片 #${sequence} 解码失败，正在自动重试...`;
+
+                if (pendingSequence === sequence) {
+                    pendingSequence = 0;
+                }
+
+                if (sequence === latestSequence) {
+                    statusElement.textContent = `照片 #${sequence} 解码失败，正在自动重试...`;
+                }
             };
 
             imageElement.src = newObjectUrl;
         } catch (error) {
-            if (sequence === latestSequence) {
-                statusElement.textContent = `照片 #${sequence} 加载失败，正在自动重试...`;
-            }
-        } finally {
             if (pendingSequence === sequence) {
                 pendingSequence = 0;
+            }
+
+            if (sequence === latestSequence) {
+                statusElement.textContent = `照片 #${sequence} 加载失败，正在自动重试...`;
             }
         }
     }
