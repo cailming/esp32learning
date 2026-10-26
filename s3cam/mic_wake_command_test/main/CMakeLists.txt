@@ -42,6 +42,7 @@ endif()
 idf_component_register(
     SRCS
         "main.c"
+        "camera_capture.c"
         "shutter_wav_player.c"
     INCLUDE_DIRS "."
     REQUIRES
