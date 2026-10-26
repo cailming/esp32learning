@@ -1,6 +1,15 @@
-# Python 3.11 is recommended for the current ChatTTS stack.
+# ttsserver is currently developed/tested for the user's Intel macOS machine.
+#
+# IMPORTANT:
+# - Use Python 3.11.
+# - PyTorch 2.2.x is the last series providing macOS x86_64 wheels.
+# - NumPy is pinned to 1.26.4 for compatibility with the PyTorch 2.2.x binary stack.
+# - Do NOT install this file with the ESP-IDF Python environment.
+
+numpy==1.26.4
+torch==2.2.2
+torchaudio==2.2.2
 ChatTTS==0.2.5
 fastapi>=0.115.0,<1.0
 uvicorn[standard]>=0.30.0,<1.0
-numpy>=1.26.0,<3.0
 requests>=2.32.0,<3.0
