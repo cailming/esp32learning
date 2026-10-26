@@ -23,11 +23,18 @@ static const char *TAG = "photo_http";
 /*
  * main/CMakeLists.txt 使用：
  *
- *   EMBED_TXTFILES "web/index.html"
+ *   EMBED_TXTFILES "index.html"
  *
- * ESP-IDF 会在文本末尾自动追加 '\0'，因此可以直接当 C 字符串发送。
+ * 为了避免不同 ESP-IDF 版本对“带子目录的嵌入资源”生成不同 linker symbol，
+ * index.html 和 shutter.wav 一样都放在组件根目录。
+ *
+ * 因此链接器符号固定为：
+ *
+ *   _binary_index_html_start
+ *
+ * EMBED_TXTFILES 会在文本末尾自动追加 '\0'，可以直接作为 C 字符串发送。
  */
-extern const uint8_t index_html_start[] asm("_binary_web_index_html_start");
+extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 
 static bool s_started = false;
 static httpd_handle_t s_server = NULL;
