@@ -10,17 +10,16 @@
 static const char *TAG = "shutter_wav";
 
 /*
- * 来自：EMBED_FILES "sounds/shutter.wav"
+ * 来自：EMBED_FILES "shutter.wav"
  *
- * ESP-IDF 会把路径中的 '/' 和 '.' 转成 '_'，因此：
+ * 为了避免带子目录路径时不同 ESP-IDF 版本的符号命名差异，
+ * 当前把 shutter.wav 放在 main 组件根目录，因此符号固定为：
  *
- *   sounds/shutter.wav
- *      ↓
- *   _binary_sounds_shutter_wav_start
- *   _binary_sounds_shutter_wav_end
+ *   _binary_shutter_wav_start
+ *   _binary_shutter_wav_end
  */
-extern const uint8_t shutter_wav_start[] asm("_binary_sounds_shutter_wav_start");
-extern const uint8_t shutter_wav_end[]   asm("_binary_sounds_shutter_wav_end");
+extern const uint8_t shutter_wav_start[] asm("_binary_shutter_wav_start");
+extern const uint8_t shutter_wav_end[]   asm("_binary_shutter_wav_end");
 
 #define OUTPUT_SAMPLE_RATE 16000U
 #define OUTPUT_FRAMES_PER_BLOCK 128U
