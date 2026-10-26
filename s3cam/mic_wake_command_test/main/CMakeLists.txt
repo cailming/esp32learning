@@ -51,5 +51,5 @@ idf_component_register(
     EMBED_FILES
         "shutter.wav"
     EMBED_TXTFILES
-        "web/index.html"
+        "index.html"
 )
