@@ -20,18 +20,19 @@ extern const uint8_t shutter_wav_start[] asm("_binary_shutter_wav_start");
 extern const uint8_t shutter_wav_end[]   asm("_binary_shutter_wav_end");
 
 /*
- * 当前真实 shutter.wav 的原始格式是：
- *   44100 Hz / mono / 16-bit PCM
+ * 当前真实 shutter.wav 的原始格式：44100 Hz / mono / 16-bit PCM。
  *
- * Speaker I2S1 也直接工作在 44100 Hz，因此这里完全不做重采样。
- * 只把 mono 样本复制成 LEFT / RIGHT 两个声道后写给 MAX98357A。
+ * MIC 的 I2S0 仍固定使用 16kHz 给 ESP-SR；Speaker 使用独立的 I2S1。
+ * 播放 WAV 前，我们把 I2S1 从平时的 16kHz 临时切到 44.1kHz，
+ * 原样播放真实 PCM，结束后再恢复 16kHz。
  *
- * 这样可以保留真实快门声里的高频瞬态，避免 44.1kHz -> 16kHz
- * 简单降采样造成的混叠、爆裂和“机关枪”听感。
+ * 这样完全避免 44.1kHz -> 16kHz 的实时降采样混叠，快门里的高频瞬态
+ * 不会再被扭曲成爆裂/“机关枪”听感。
  */
-#define SHUTTER_SAMPLE_RATE       44100U
-#define OUTPUT_FRAMES_PER_BLOCK  128U
-#define OUTPUT_GAIN_PERCENT      70
+#define SHUTTER_SAMPLE_RATE        44100U
+#define SPEAKER_IDLE_SAMPLE_RATE   16000U
+#define OUTPUT_FRAMES_PER_BLOCK   128U
+#define OUTPUT_GAIN_PERCENT       70
 
 static int16_t s_output[OUTPUT_FRAMES_PER_BLOCK * 2U];
 
@@ -71,7 +72,7 @@ static bool fourcc_is(const uint8_t *p,
 
 /*
  * RIFF/WAV 的 fmt/data chunk 不保证紧挨着，因此逐个扫描 chunk。
- * 当前只支持本项目真正使用的标准 PCM：mono / 16-bit。
+ * 当前只接受本工程实际使用的标准 PCM：mono / 16-bit / 44.1kHz。
  */
 static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
 {
@@ -173,6 +174,48 @@ static int16_t apply_gain(int32_t sample)
     return (int16_t)sample;
 }
 
+/*
+ * 标准 I2S 的时钟只能在 channel 停止状态下重新配置。
+ * 因此流程严格是：disable -> reconfig clock -> enable。
+ */
+static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
+                                         uint32_t sample_rate)
+{
+    esp_err_t err = i2s_channel_disable(tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "i2s_channel_disable before %u Hz failed: %s",
+                 (unsigned)sample_rate,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
+
+    err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "reconfig I2S clock to %u Hz failed: %s",
+                 (unsigned)sample_rate,
+                 esp_err_to_name(err));
+        /* 尽量把 channel 恢复 enable，避免后续完全无声。 */
+        i2s_channel_enable(tx_chan);
+        return err;
+    }
+
+    err = i2s_channel_enable(tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "i2s_channel_enable at %u Hz failed: %s",
+                 (unsigned)sample_rate,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Speaker I2S clock -> %u Hz", (unsigned)sample_rate);
+    return ESP_OK;
+}
+
 esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
 {
     if (tx_chan == NULL) {
@@ -190,9 +233,17 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
     const size_t source_samples = wav.pcm_size / sizeof(int16_t);
 
     ESP_LOGI(TAG,
-             "Play embedded WAV directly: %u Hz mono 16-bit, %u samples",
+             "Play embedded WAV natively: %u Hz mono 16-bit, %u samples",
              (unsigned)wav.sample_rate,
              (unsigned)source_samples);
+
+    /*
+     * 关键修正：让 I2S1 跟随 WAV 的原始 44.1kHz，完全取消软件重采样。
+     */
+    err = speaker_set_sample_rate(tx_chan, wav.sample_rate);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     size_t source_index = 0;
 
@@ -206,10 +257,7 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
             int16_t sample = apply_gain(
                 pcm16_at(wav.pcm, source_index + i));
 
-            /*
-             * WAV 是 mono；MAX98357A 当前使用 stereo framing，
-             * 所以把同一个真实 PCM 样本复制到 LEFT / RIGHT。
-             */
+            /* WAV 是 mono；I2S 使用 stereo framing，左右复制同一个样本。 */
             s_output[i * 2U] = sample;
             s_output[i * 2U + 1U] = sample;
         }
@@ -224,7 +272,7 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
                                 pdMS_TO_TICKS(1000));
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(err));
-            return err;
+            break;
         }
 
         if (bytes_written != bytes_to_write) {
@@ -232,11 +280,22 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
                      "Partial I2S write: %u/%u bytes",
                      (unsigned)bytes_written,
                      (unsigned)bytes_to_write);
-            return ESP_FAIL;
+            err = ESP_FAIL;
+            break;
         }
 
         source_index += frames;
     }
 
-    return ESP_OK;
+    /*
+     * 播放完成后把 I2S1 恢复到工程原来的 16kHz 空闲配置。
+     * 即使播放中途失败，也尽量执行恢复。
+     */
+    esp_err_t restore_err = speaker_set_sample_rate(tx_chan,
+                                                    SPEAKER_IDLE_SAMPLE_RATE);
+    if (err == ESP_OK && restore_err != ESP_OK) {
+        err = restore_err;
+    }
+
+    return err;
 }
