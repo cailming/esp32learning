@@ -5,17 +5,19 @@
 # 第一次配置工程时，从固定 commit 下载 Mozilla / Firefox DevTools 使用的
 # shutter.wav，然后通过 EMBED_FILES 原样打进 ESP32 固件。
 #
-# 固定 commit 的目的是保证以后重新编译时拿到同一个声音文件。
-# 资源说明见 sounds/README.md。
+# 这里故意把 WAV 放在当前组件根目录，而不是 sounds/ 子目录：
+# 这样 ESP-IDF 生成的链接符号固定为：
 #
-set(SHUTTER_SOUND_DIR "${CMAKE_CURRENT_LIST_DIR}/sounds")
-set(SHUTTER_SOUND_FILE "${SHUTTER_SOUND_DIR}/shutter.wav")
+#   _binary_shutter_wav_start
+#   _binary_shutter_wav_end
+#
+# 可以避免不同 ESP-IDF 版本对带路径 EMBED_FILES 的符号命名差异。
+#
+set(SHUTTER_SOUND_FILE "${CMAKE_CURRENT_LIST_DIR}/shutter.wav")
 set(SHUTTER_SOUND_URL
     "https://raw.githubusercontent.com/mozilla/gecko-dev/5836a062726f715fda621338a17b51aff30d0a8c/devtools/client/themes/audio/shutter.wav")
 
 if(NOT EXISTS "${SHUTTER_SOUND_FILE}")
-    file(MAKE_DIRECTORY "${SHUTTER_SOUND_DIR}")
-
     message(STATUS "Downloading real camera shutter WAV -> ${SHUTTER_SOUND_FILE}")
 
     file(DOWNLOAD
@@ -45,5 +47,5 @@ idf_component_register(
     REQUIRES
         esp_driver_i2s
     EMBED_FILES
-        "sounds/shutter.wav"
+        "shutter.wav"
 )
