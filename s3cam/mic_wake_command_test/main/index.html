@@ -61,12 +61,70 @@
 </div>
 
 <script>
-    let lastSequence = 0;
+    /*
+     * displayedSequence：浏览器已经真正加载成功并显示出来的照片序号。
+     * pendingSequence  ：当前正在下载的照片序号。
+     * latestSequence   ：/status 最近一次告诉我们的最新照片序号。
+     *
+     * 旧版代码在设置 image.src 之前就先更新 lastSequence；如果那一次图片
+     * 请求失败，页面会误以为已经显示过，从而一直等到下一次拍照才重试。
+     * 现在只有图片 onload 成功以后才更新 displayedSequence；请求失败时
+     * pendingSequence 会清零，下一轮 /status 轮询会自动重试同一张照片。
+     */
+    let displayedSequence = 0;
+    let pendingSequence = 0;
+    let latestSequence = 0;
+
+    const statusElement = document.getElementById('status');
+    const imageElement = document.getElementById('photo');
+
+    function loadPhoto(sequence) {
+        if (sequence <= 0 || sequence === displayedSequence || sequence === pendingSequence) {
+            return;
+        }
+
+        pendingSequence = sequence;
+
+        /*
+         * 先用独立 Image 对象预加载。
+         * 只有 JPEG 完整下载成功，才替换页面上当前正在显示的照片，
+         * 避免一次失败请求把原本正常的旧照片也弄成破图。
+         */
+        const loader = new Image();
+        const url = `/photo.jpg?n=${sequence}&ts=${Date.now()}`;
+
+        loader.onload = () => {
+            /*
+             * 如果加载期间又拍了更新的照片，只允许当前最新序号覆盖页面。
+             * 较旧请求即使晚到，也不会把新照片覆盖回旧照片。
+             */
+            if (sequence === latestSequence) {
+                imageElement.src = url;
+                imageElement.style.display = 'block';
+                displayedSequence = sequence;
+                statusElement.textContent = `照片 #${sequence} 已显示`;
+            }
+
+            if (pendingSequence === sequence) {
+                pendingSequence = 0;
+            }
+        };
+
+        loader.onerror = () => {
+            /* 不更新 displayedSequence，让下一次 500ms 轮询自动重试。 */
+            if (pendingSequence === sequence) {
+                pendingSequence = 0;
+            }
+
+            if (sequence === latestSequence) {
+                statusElement.textContent = `照片 #${sequence} 加载失败，正在自动重试...`;
+            }
+        };
+
+        loader.src = url;
+    }
 
     async function pollStatus() {
-        const statusElement = document.getElementById('status');
-        const image = document.getElementById('photo');
-
         try {
             const response = await fetch(`/status?ts=${Date.now()}`, {
                 cache: 'no-store'
@@ -79,18 +137,23 @@
             const status = await response.json();
 
             if (!status.has_photo) {
+                latestSequence = 0;
                 statusElement.textContent = '等待第一次语音拍照...';
                 return;
             }
 
-            statusElement.textContent =
-                `最新照片 #${status.sequence} · ${status.width}×${status.height} · ${status.bytes} bytes`;
+            latestSequence = status.sequence;
 
-            if (status.sequence !== lastSequence) {
-                lastSequence = status.sequence;
-                image.src = `/photo.jpg?n=${status.sequence}&ts=${Date.now()}`;
-                image.style.display = 'block';
+            if (displayedSequence === latestSequence) {
+                statusElement.textContent =
+                    `最新照片 #${status.sequence} · ${status.width}×${status.height} · ${status.bytes} bytes`;
+                return;
             }
+
+            statusElement.textContent =
+                `检测到新照片 #${status.sequence} · ${status.width}×${status.height} · ${status.bytes} bytes，正在加载...`;
+
+            loadPhoto(latestSequence);
         } catch (error) {
             statusElement.textContent = '与 ESP32-S3 通信失败，请确认仍连接 S3CAM-Photo';
         }
