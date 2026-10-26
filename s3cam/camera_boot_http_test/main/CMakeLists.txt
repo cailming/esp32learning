@@ -9,4 +9,6 @@ idf_component_register(
         esp_http_server
         nvs_flash
         esp_driver_gpio
+    EMBED_TXTFILES
+        "web/index.html"
 )
