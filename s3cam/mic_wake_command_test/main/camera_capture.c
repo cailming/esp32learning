@@ -111,7 +111,8 @@ esp_err_t camera_capture_init(void)
 
         /* OV3660 直接输出 JPEG，避免 ESP32 软件压缩。 */
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,
+        // .frame_size = FRAMESIZE_QVGA,
+        .frame_size = FRAMESIZE_VGA,
         .jpeg_quality = 12,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_DRAM,
