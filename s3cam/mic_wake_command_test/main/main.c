@@ -20,7 +20,7 @@
  *      v
  *   ESP-SR AFE
  *      |
- *      +--> WakeNet：等待“Hi 乐鑫”
+ *      +--> WakeNet10：等待“你好小智”
  *      |
  *      +--> 唤醒后进入 MultiNet6 中文命令识别
  *               |
@@ -470,7 +470,7 @@ static void speech_detect_task(void *arg)
     bool command_mode = false;
 
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "READY: 等待唤醒词 -> Hi 乐鑫");
+    ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
     ESP_LOGI(TAG, "唤醒后可以连续说命令，约 6 秒无有效命令后自动退出命令模式");
     ESP_LOGI(TAG, "====================================================");
 
@@ -487,7 +487,7 @@ static void speech_detect_task(void *arg)
          */
         if (result->wakeup_state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "****************************************************");
-            ESP_LOGI(TAG, "WAKE WORD DETECTED: Hi 乐鑫");
+            ESP_LOGI(TAG, "WAKE WORD DETECTED: 你好小智");
             ESP_LOGI(TAG, "现在请说命令，例如：拍照 / 开始录像 / 状态查询");
             ESP_LOGI(TAG, "****************************************************");
 
@@ -526,7 +526,7 @@ static void speech_detect_task(void *arg)
                     s_afe_handle->enable_wakenet(afe_data);
                     multinet->clean(model_data);
                     command_mode = false;
-                    ESP_LOGI(TAG, "重新等待唤醒词：Hi 乐鑫");
+                    ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
                 }
             }
 
@@ -541,7 +541,7 @@ static void speech_detect_task(void *arg)
             multinet->clean(model_data);
             command_mode = false;
 
-            ESP_LOGI(TAG, "重新等待唤醒词：Hi 乐鑫");
+            ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
         }
     }
 
@@ -558,7 +558,7 @@ void app_main(void)
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "ESP32-S3 MIC WAKE + VOICE COMMAND TEST");
     ESP_LOGI(TAG, "INMP441: BCLK=42 WS=41 DIN=1 (LEFT)");
-    ESP_LOGI(TAG, "WakeNet : Hi 乐鑫");
+    ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
     ESP_LOGI(TAG, "MultiNet: Chinese offline command recognition");
     ESP_LOGI(TAG, "Camera / MAX98357A / Speaker 保持物理接线，不需要拔线");
     ESP_LOGI(TAG, "====================================================");
