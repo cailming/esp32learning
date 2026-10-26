@@ -11,7 +11,7 @@ I2S0 RX
    ↓
 ESP-SR AFE
    ↓
-WakeNet（Hi 乐鑫）
+WakeNet10（你好小智）
    ↓
 MultiNet6 中文命令识别
    ↓
@@ -34,8 +34,16 @@ ESP32-S3 可以直接运行乐鑫官方 ESP-SR：
 
 ```text
 ESP-SR ^2.6.0
-WakeNet9：Hi 乐鑫
+WakeNet10：你好小智
+WakeNet10 模型：wn10_nihaoxiaozhi
 MultiNet6：中文命令词
+```
+
+`sdkconfig.defaults` 中对应配置：
+
+```text
+CONFIG_SR_WN_WN10_NIHAOXIAOZHI=y
+CONFIG_SR_MN_CN_MULTINET6_QUANT=y
 ```
 
 选择较新的 ESP-SR 是因为 2.5.0 起已包含 ESP-IDF 6.1 Kconfig 兼容修复。
@@ -67,7 +75,7 @@ RIGHT channel = 0
 唤醒词：
 
 ```text
-Hi 乐鑫
+你好小智
 ```
 
 唤醒成功后直接说中文：
@@ -129,6 +137,8 @@ ESP-SR 会把选中的 WakeNet / MultiNet 模型打包并烧录到 `model` 分�
 
 第一次编译需要下载 ESP-SR Managed Component，所以电脑需要能访问 ESP Component Registry。
 
+切换 WakeNet 模型以后，建议删除旧的 `build` 和 `sdkconfig`，确保新的模型选择真正生效：
+
 ```bash
 cd s3cam/mic_wake_command_test
 
@@ -174,7 +184,7 @@ idf.py -p /dev/cu.usbserial-0001 flash monitor
 最终应看到类似：
 
 ```text
-READY: 等待唤醒词 -> Hi 乐鑫
+READY: 等待唤醒词 -> 你好小智
 ```
 
 同时会周期性看到：
@@ -192,13 +202,13 @@ MIC alive: peak=xxxx
 对着麦克风说：
 
 ```text
-Hi 乐鑫
+你好小智
 ```
 
 期望：
 
 ```text
-WAKE WORD DETECTED: Hi 乐鑫
+WAKE WORD DETECTED: 你好小智
 现在请说命令，例如：拍照 / 开始录像 / 状态查询
 ```
 
@@ -245,7 +255,7 @@ ACTION: STATUS video=ON, sound=ON, photo_requests=1
 立即回到：
 
 ```text
-重新等待唤醒词：Hi 乐鑫
+重新等待唤醒词：你好小智
 ```
 
 ## 关于音频格式
@@ -301,7 +311,7 @@ Camera / Speaker 仍保持物理连接，但程序暂时不初始化它们。
 等这个测试通过后，再把它和已经通过的 Camera + Speaker 代码合起来，形成真正的：
 
 ```text
-“Hi 乐鑫”
+“你好小智”
    ↓
 “拍照”
    ↓
