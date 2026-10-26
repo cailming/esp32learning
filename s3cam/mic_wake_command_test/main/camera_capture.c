@@ -132,11 +132,21 @@ esp_err_t camera_capture_init(void)
 
         /* OV3660 直接输出 JPEG，避免 ESP32 软件压缩。 */
         .pixel_format = PIXFORMAT_JPEG,
-        // .frame_size = FRAMESIZE_QVGA,
         .frame_size = FRAMESIZE_VGA,
         .jpeg_quality = 12,
         .fb_count = 1,
-        .fb_location = CAMERA_FB_IN_DRAM,
+
+        /*
+         * VGA JPEG framebuffer 必须放 PSRAM。
+         *
+         * 之前这里使用 CAMERA_FB_IN_DRAM。320x240 时还能勉强工作，切到
+         * 640x480 后会吃掉大量内部 DRAM，导致 Wi-Fi 初始化时静态 RX buffer
+         * 只能申请到 9/10，最终 esp_wifi_init() 返回 ESP_ERR_NO_MEM。
+         *
+         * 当前 sdkconfig 已启用 PSRAM，因此把 Camera framebuffer 搬到 PSRAM，
+         * 把内部 DRAM 留给 ESP-SR、Wi-Fi、HTTP Server 和 FreeRTOS task。
+         */
+        .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
     };
 
@@ -150,12 +160,18 @@ esp_err_t camera_capture_init(void)
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL) {
         ESP_LOGI(TAG,
-                 "Camera ready: PID=0x%04x VER=0x%02x, frame_size=VGA, JPEG quality=12, fb_count=1, grab=WHEN_EMPTY",
+                 "Camera ready: PID=0x%04x VER=0x%02x, frame_size=VGA, JPEG quality=12, fb_count=1, fb=PSRAM, grab=WHEN_EMPTY",
                  sensor->id.PID,
                  sensor->id.VER);
     } else {
         ESP_LOGW(TAG, "Camera initialized but sensor descriptor is NULL");
     }
+
+    ESP_LOGI(TAG,
+             "Memory after Camera init: internal=%u bytes, largest_internal=%u bytes, psram=%u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     /*
      * 上电预热只负责丢掉初始化阶段可能不稳定的第一帧。
