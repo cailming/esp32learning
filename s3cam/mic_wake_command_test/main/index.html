@@ -62,66 +62,88 @@
 
 <script>
     /*
-     * displayedSequence：浏览器已经真正加载成功并显示出来的照片序号。
+     * displayedSequence：浏览器已经真正显示成功的照片序号。
      * pendingSequence  ：当前正在下载的照片序号。
-     * latestSequence   ：/status 最近一次告诉我们的最新照片序号。
+     * latestSequence   ：/status 最近一次返回的最新照片序号。
      *
-     * 旧版代码在设置 image.src 之前就先更新 lastSequence；如果那一次图片
-     * 请求失败，页面会误以为已经显示过，从而一直等到下一次拍照才重试。
-     * 现在只有图片 onload 成功以后才更新 displayedSequence；请求失败时
-     * pendingSequence 会清零，下一轮 /status 轮询会自动重试同一张照片。
+     * 旧版代码在 image.src 真正加载成功前就更新 lastSequence。
+     * 一旦某次 /photo.jpg 请求失败，后续轮询会误以为该序号已经显示过，
+     * 只能等下一次拍照 sequence 改变才再次请求，于是用户会感觉需要拍两三次。
+     *
+     * 当前实现只有 JPEG 完整 fetch 成功并显示后才更新 displayedSequence；
+     * 请求失败则保持 displayedSequence 不变，下一轮 500ms 轮询自动重试同一张。
      */
     let displayedSequence = 0;
     let pendingSequence = 0;
     let latestSequence = 0;
+    let currentObjectUrl = null;
 
     const statusElement = document.getElementById('status');
     const imageElement = document.getElementById('photo');
 
-    function loadPhoto(sequence) {
+    async function loadPhoto(sequence) {
         if (sequence <= 0 || sequence === displayedSequence || sequence === pendingSequence) {
             return;
         }
 
         pendingSequence = sequence;
 
-        /*
-         * 先用独立 Image 对象预加载。
-         * 只有 JPEG 完整下载成功，才替换页面上当前正在显示的照片，
-         * 避免一次失败请求把原本正常的旧照片也弄成破图。
-         */
-        const loader = new Image();
-        const url = `/photo.jpg?n=${sequence}&ts=${Date.now()}`;
-
-        loader.onload = () => {
+        try {
             /*
-             * 如果加载期间又拍了更新的照片，只允许当前最新序号覆盖页面。
-             * 较旧请求即使晚到，也不会把新照片覆盖回旧照片。
+             * 直接 fetch JPEG 为 Blob，只发生一次 HTTP 请求。
+             * 不再先 new Image() 预加载、再把同一 no-store URL 赋给页面 img，
+             * 避免浏览器因为 Cache-Control: no-store 再发第二次请求。
              */
-            if (sequence === latestSequence) {
-                imageElement.src = url;
-                imageElement.style.display = 'block';
+            const response = await fetch(`/photo.jpg?n=${sequence}&ts=${Date.now()}`, {
+                cache: 'no-store'
+            });
+
+            if (!response.ok) {
+                throw new Error(`photo HTTP ${response.status}`);
+            }
+
+            const blob = await response.blob();
+            if (!blob || blob.size === 0) {
+                throw new Error('empty photo blob');
+            }
+
+            /*
+             * 如果下载过程中又拍了更新的照片，旧请求即使成功也不要覆盖新照片。
+             * 下一轮 /status 会继续拉取最新 sequence。
+             */
+            if (sequence !== latestSequence) {
+                return;
+            }
+
+            const newObjectUrl = URL.createObjectURL(blob);
+            const oldObjectUrl = currentObjectUrl;
+
+            imageElement.onload = () => {
+                if (oldObjectUrl) {
+                    URL.revokeObjectURL(oldObjectUrl);
+                }
+
+                currentObjectUrl = newObjectUrl;
                 displayedSequence = sequence;
+                imageElement.style.display = 'block';
                 statusElement.textContent = `照片 #${sequence} 已显示`;
-            }
+            };
 
-            if (pendingSequence === sequence) {
-                pendingSequence = 0;
-            }
-        };
+            imageElement.onerror = () => {
+                URL.revokeObjectURL(newObjectUrl);
+                statusElement.textContent = `照片 #${sequence} 解码失败，正在自动重试...`;
+            };
 
-        loader.onerror = () => {
-            /* 不更新 displayedSequence，让下一次 500ms 轮询自动重试。 */
-            if (pendingSequence === sequence) {
-                pendingSequence = 0;
-            }
-
+            imageElement.src = newObjectUrl;
+        } catch (error) {
             if (sequence === latestSequence) {
                 statusElement.textContent = `照片 #${sequence} 加载失败，正在自动重试...`;
             }
-        };
-
-        loader.src = url;
+        } finally {
+            if (pendingSequence === sequence) {
+                pendingSequence = 0;
+            }
+        }
     }
 
     async function pollStatus() {
@@ -131,7 +153,7 @@
             });
 
             if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+                throw new Error(`status HTTP ${response.status}`);
             }
 
             const status = await response.json();
