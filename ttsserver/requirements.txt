@@ -1,0 +1,6 @@
+# Python 3.11 is recommended for the current ChatTTS stack.
+ChatTTS==0.2.5
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+numpy>=1.26.0,<3.0
+requests>=2.32.0,<3.0
