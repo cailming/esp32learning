@@ -111,7 +111,7 @@ esp_err_t camera_capture_init(void)
 
         /* OV3660 直接输出 JPEG，避免 ESP32 软件压缩。 */
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,      // 320 x 240，先沿用已验证稳定配置
+        .frame_size = FRAMESIZE_QVGA,
         .jpeg_quality = 12,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_DRAM,
@@ -195,12 +195,10 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
 
     memcpy(new_jpeg, fb->buf, fb->len);
 
-    /* 先保存本次元数据，因为 framebuffer 随后就会归还。 */
     const size_t new_size = fb->len;
     const uint16_t new_width = (uint16_t)fb->width;
     const uint16_t new_height = (uint16_t)fb->height;
 
-    /* JPEG 已复制，尽快归还 Camera framebuffer。 */
     esp_camera_fb_return(fb);
     fb = NULL;
 
@@ -272,4 +270,45 @@ const uint8_t *camera_capture_latest(size_t *size,
 
     xSemaphoreGive(s_photo_mutex);
     return result;
+}
+
+esp_err_t camera_capture_copy_latest(uint8_t **jpeg_copy,
+                                     camera_photo_info_t *info)
+{
+    if (jpeg_copy == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *jpeg_copy = NULL;
+
+    if (s_photo_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_photo_mutex, portMAX_DELAY);
+
+    if (s_latest_jpeg == NULL || s_latest_jpeg_size == 0) {
+        xSemaphoreGive(s_photo_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    uint8_t *copy = allocate_jpeg_buffer(s_latest_jpeg_size);
+    if (copy == NULL) {
+        xSemaphoreGive(s_photo_mutex);
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(copy, s_latest_jpeg, s_latest_jpeg_size);
+
+    if (info != NULL) {
+        info->sequence = s_sequence;
+        info->width = s_latest_width;
+        info->height = s_latest_height;
+        info->jpeg_size = s_latest_jpeg_size;
+    }
+
+    xSemaphoreGive(s_photo_mutex);
+
+    *jpeg_copy = copy;
+    return ESP_OK;
 }
