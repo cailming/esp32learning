@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "camera_capture.h"
+#include "esp_check.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
