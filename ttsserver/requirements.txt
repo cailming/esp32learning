@@ -3,10 +3,13 @@
 # IMPORTANT:
 # - Use Python 3.11.
 # - PyTorch 2.2.x is the last series providing macOS x86_64 wheels.
-# - NumPy is pinned to 1.26.4 for compatibility with the PyTorch 2.2.x binary stack.
+# - Numba/llvmlite are pinned to versions that provide CPython 3.11 macOS x86_64 wheels.
+# - NumPy is pinned to 1.26.4 for compatibility with this binary stack.
 # - Do NOT install this file with the ESP-IDF Python environment.
 
 numpy==1.26.4
+llvmlite==0.42.0
+numba==0.59.1
 torch==2.2.2
 torchaudio==2.2.2
 ChatTTS==0.2.5
