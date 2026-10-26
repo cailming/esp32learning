@@ -41,22 +41,30 @@ static uint16_t s_latest_height = 0;
 static uint32_t s_sequence = 0;
 static bool s_initialized = false;
 
-static bool jpeg_has_valid_markers(const camera_fb_t *fb)
+/*
+ * 沿用 camera_boot_http_test 已经验证过的 JPEG 判断方式：
+ *
+ *   format == PIXFORMAT_JPEG
+ *   buf != NULL
+ *   len >= 4
+ *   开头为 JPEG SOI：FF D8
+ *
+ * 不强制要求 framebuffer 最后两个字节恰好是 FF D9，避免某些驱动/帧缓冲
+ * 尾部存在填充字节时把一张可用 JPEG 误判为失败。
+ */
+static bool jpeg_is_valid(const camera_fb_t *fb)
 {
-    if (fb == NULL || fb->buf == NULL || fb->len < 4) {
-        return false;
-    }
-
-    /* JPEG SOI = FF D8；EOI = FF D9。 */
-    return fb->buf[0] == 0xFF
-           && fb->buf[1] == 0xD8
-           && fb->buf[fb->len - 2] == 0xFF
-           && fb->buf[fb->len - 1] == 0xD9;
+    return fb != NULL
+           && fb->format == PIXFORMAT_JPEG
+           && fb->buf != NULL
+           && fb->len >= 4
+           && fb->buf[0] == 0xFF
+           && fb->buf[1] == 0xD8;
 }
 
 static uint8_t *allocate_jpeg_buffer(size_t size)
 {
-    /* 优先放 PSRAM，避免占用宝贵的内部 DRAM；没有 PSRAM 时再回退普通内存。 */
+    /* 优先放 PSRAM，避免占用内部 DRAM；没有 PSRAM 时回退普通内存。 */
     uint8_t *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buffer == NULL) {
         buffer = malloc(size);
@@ -101,8 +109,9 @@ esp_err_t camera_capture_init(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
 
+        /* OV3660 直接输出 JPEG，避免 ESP32 软件压缩。 */
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,
+        .frame_size = FRAMESIZE_QVGA,      // 320 x 240，先沿用已验证稳定配置
         .jpeg_quality = 12,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_DRAM,
@@ -119,17 +128,16 @@ esp_err_t camera_capture_init(void)
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL) {
         ESP_LOGI(TAG,
-                 "Camera ready: PID=0x%04x VER=0x%02x, QVGA JPEG quality=%d",
+                 "Camera ready: PID=0x%04x VER=0x%02x, QVGA JPEG quality=12",
                  sensor->id.PID,
-                 sensor->id.VER,
-                 12);
+                 sensor->id.VER);
     } else {
         ESP_LOGW(TAG, "Camera initialized but sensor descriptor is NULL");
     }
 
     /*
      * 某些 Camera 上电后的第一帧可能不稳定。
-     * 这里预热抓取一帧并立即归还，正式“拍照”从下一帧开始。
+     * 预热抓取一帧并立即归还，正式“拍照”从下一帧开始。
      */
     camera_fb_t *warmup = esp_camera_fb_get();
     if (warmup != NULL) {
@@ -155,22 +163,17 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == NULL) {
-        ESP_LOGE(TAG, "esp_camera_fb_get returned NULL");
+        ESP_LOGE(TAG, "Capture failed: esp_camera_fb_get returned NULL");
         return ESP_FAIL;
     }
 
     esp_err_t err = ESP_OK;
     uint8_t *new_jpeg = NULL;
 
-    if (fb->format != PIXFORMAT_JPEG) {
-        ESP_LOGE(TAG, "Unexpected frame format=%d, require JPEG", (int)fb->format);
-        err = ESP_ERR_INVALID_RESPONSE;
-        goto out;
-    }
-
-    if (!jpeg_has_valid_markers(fb)) {
+    if (!jpeg_is_valid(fb)) {
         ESP_LOGE(TAG,
-                 "Invalid JPEG markers: %ux%u, len=%u",
+                 "Capture failed: invalid JPEG, format=%d %ux%u len=%u",
+                 (int)fb->format,
                  (unsigned)fb->width,
                  (unsigned)fb->height,
                  (unsigned)fb->len);
@@ -178,22 +181,40 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
         goto out;
     }
 
+    /*
+     * fb->buf 属于 Camera 驱动，esp_camera_fb_return() 以后不能再使用。
+     * 因此这里复制一份，作为业务层真正的“最新照片”。
+     */
     new_jpeg = allocate_jpeg_buffer(fb->len);
     if (new_jpeg == NULL) {
-        ESP_LOGE(TAG, "No memory for JPEG copy: %u bytes", (unsigned)fb->len);
+        ESP_LOGE(TAG, "Capture failed: no memory for JPEG copy (%u bytes)",
+                 (unsigned)fb->len);
         err = ESP_ERR_NO_MEM;
         goto out;
     }
 
     memcpy(new_jpeg, fb->buf, fb->len);
 
+    /* 先保存本次元数据，因为 framebuffer 随后就会归还。 */
+    const size_t new_size = fb->len;
+    const uint16_t new_width = (uint16_t)fb->width;
+    const uint16_t new_height = (uint16_t)fb->height;
+
+    /* JPEG 已复制，尽快归还 Camera framebuffer。 */
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    /*
+     * 成功抓拍并成功复制后才替换上一张照片。
+     * 如果任何步骤失败，上一张有效照片仍保留。
+     */
     xSemaphoreTake(s_photo_mutex, portMAX_DELAY);
 
     uint8_t *old_jpeg = s_latest_jpeg;
     s_latest_jpeg = new_jpeg;
-    s_latest_jpeg_size = fb->len;
-    s_latest_width = (uint16_t)fb->width;
-    s_latest_height = (uint16_t)fb->height;
+    s_latest_jpeg_size = new_size;
+    s_latest_width = new_width;
+    s_latest_height = new_height;
     ++s_sequence;
 
     if (info != NULL) {
@@ -203,6 +224,7 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
         info->jpeg_size = s_latest_jpeg_size;
     }
 
+    const uint32_t sequence = s_sequence;
     xSemaphoreGive(s_photo_mutex);
 
     free(old_jpeg);
@@ -210,13 +232,15 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
 
     ESP_LOGI(TAG,
              "PHOTO CAPTURED: #%lu %ux%u JPEG %u bytes",
-             (unsigned long)s_sequence,
-             (unsigned)s_latest_width,
-             (unsigned)s_latest_height,
-             (unsigned)s_latest_jpeg_size);
+             (unsigned long)sequence,
+             (unsigned)new_width,
+             (unsigned)new_height,
+             (unsigned)new_size);
 
 out:
-    esp_camera_fb_return(fb);
+    if (fb != NULL) {
+        esp_camera_fb_return(fb);
+    }
     free(new_jpeg);
     return err;
 }
