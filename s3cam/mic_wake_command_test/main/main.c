@@ -1,12 +1,18 @@
 /*
- * ESP32-S3-CAM：INMP441 语音唤醒 + 中文命令词识别测试
+ * ESP32-S3-CAM：INMP441 语音唤醒 + 中文命令词识别 + 快门音测试
  *
- * 硬件沿用已经通过 mic_test 的接线：
+ * 硬件沿用已经验证通过的接线：
  *
  *   INMP441 SCK/BCLK -> GPIO42
  *   INMP441 WS/LRCLK -> GPIO41
  *   INMP441 SD       -> GPIO1
  *   INMP441 L/R      -> GND（数据位于 LEFT channel）
+ *
+ *   MAX98357A BCLK   -> GPIO14
+ *   MAX98357A LRC    -> GPIO3
+ *   MAX98357A DIN    -> GPIO46
+ *   MAX98357A VIN    -> 5V
+ *   MAX98357A GND    -> 公共 GND
  *
  * 整体流程：
  *
@@ -27,10 +33,10 @@
  *               v
  *         execute_voice_command()
  *               |
- *               +--> 打印 ACTION / 更新测试状态
+ *               +--> “拍照” -> I2S1 -> MAX98357A -> 播放“咔嚓”快门音
  *
- * 当前版本的“执行动作”是测试级动作：更新内存状态并打印串口日志。
- * 后续可以把 switch-case 中的动作直接替换成 Camera / Speaker 的真实业务调用。
+ * 当前版本的 Camera 动作仍然是测试级动作：只累计拍照请求次数。
+ * 但“拍照”命令已经会真实驱动 MAX98357A + Speaker 播放快门音。
  */
 
 #include <assert.h>
@@ -38,6 +44,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "driver/i2s_std.h"
 #include "esp_check.h"
@@ -65,7 +72,7 @@
 static const char *TAG = "voice_cmd";
 
 /* ========================================================================
- * 1. INMP441 / I2S 配置
+ * 1. INMP441 / I2S0 RX 配置
  * ======================================================================== */
 #define MIC_I2S_PORT     I2S_NUM_0
 #define MIC_BCLK_GPIO    GPIO_NUM_42
@@ -86,7 +93,41 @@ static const char *TAG = "voice_cmd";
 static i2s_chan_handle_t s_mic_rx = NULL;
 
 /* ========================================================================
- * 2. ESP-SR 全局对象
+ * 2. MAX98357A / I2S1 TX 配置
+ * ========================================================================
+ *
+ * 这一组 GPIO 完全沿用已经通过 speaker_test 的接线。
+ * MIC 使用 I2S0/RX，Speaker 使用 I2S1/TX，两边互不抢 I2S 控制器。
+ */
+#define SPK_I2S_PORT       I2S_NUM_1
+#define SPK_BCLK_GPIO      GPIO_NUM_14
+#define SPK_WS_GPIO        GPIO_NUM_3
+#define SPK_DOUT_GPIO      GPIO_NUM_46
+#define SPK_SAMPLE_RATE    16000
+#define SPK_FRAMES_BLOCK   128
+
+/*
+ * 快门音是两个很短的衰减噪声脉冲。
+ * 音量刻意控制在中等水平，避免突然过响。
+ */
+#define SHUTTER_CLICK_AMPLITUDE 4000
+#define SHUTTER_CLACK_AMPLITUDE 2800
+
+static i2s_chan_handle_t s_speaker_tx = NULL;
+static int16_t s_speaker_audio[SPK_FRAMES_BLOCK * 2];
+
+/*
+ * Speaker 播放期间置为 true。
+ * audio_feed_task 仍然继续读取 MIC，避免 I2S RX 堵塞，
+ * 但送给 ESP-SR AFE 的样本会临时改成 0，避免设备自己的“咔嚓”声被再次识别。
+ */
+static volatile bool s_speaker_playing = false;
+
+/* 用于生成短促伪随机噪声的状态，不需要真正的随机数。 */
+static uint32_t s_shutter_noise_state = 0x13579BDFU;
+
+/* ========================================================================
+ * 3. ESP-SR 全局对象
  * ======================================================================== */
 static const esp_afe_sr_iface_t *s_afe_handle = NULL;
 static esp_afe_sr_data_t *s_afe_data = NULL;
@@ -94,7 +135,7 @@ static srmodel_list_t *s_models = NULL;
 static volatile bool s_running = true;
 
 /* ========================================================================
- * 3. 测试命令定义
+ * 4. 测试命令定义
  * ========================================================================
  *
  * MultiNet6 中文命令使用拼音作为识别单元。
@@ -128,15 +169,18 @@ static const voice_command_def_t s_commands[] = {
 };
 
 /*
- * 这些变量只是用来证明“命令已经被解析并执行到业务分支”。
- * 后续接真实 Camera/Speaker 时，可以把这些状态替换成真实模块状态。
+ * 这些变量用于证明“命令已经被解析并执行到业务分支”。
+ *
+ * s_sound_enabled 现在已经有真实作用：
+ *   true  -> “拍照”时播放快门音
+ *   false -> “拍照”时静音
  */
 static bool s_video_recording = false;
 static bool s_sound_enabled = true;
 static uint32_t s_photo_request_count = 0;
 
 /* ========================================================================
- * 4. 工具函数
+ * 5. 通用工具函数
  * ======================================================================== */
 
 /* 将 32-bit 麦克风样本转换成 ESP-SR 需要的 16-bit PCM，并做饱和保护。 */
@@ -165,8 +209,234 @@ static const char *command_name_from_id(int command_id)
     return "未知命令";
 }
 
+/* ========================================================================
+ * 6. MAX98357A / Speaker 初始化与快门音
+ * ======================================================================== */
+static esp_err_t init_speaker_i2s(void)
+{
+    /* 创建 I2S1 TX channel。 */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(SPK_I2S_PORT,
+                                                            I2S_ROLE_MASTER);
+
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_speaker_tx, NULL),
+                        TAG,
+                        "speaker i2s_new_channel failed");
+
+    /*
+     * 和已经验证通过的 speaker_test 保持一致：
+     * - 16kHz
+     * - 16-bit
+     * - stereo framing
+     * - LEFT / RIGHT 发送相同数据
+     */
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT,
+            I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SPK_BCLK_GPIO,
+            .ws = SPK_WS_GPIO,
+            .dout = SPK_DOUT_GPIO,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_speaker_tx, &std_cfg),
+                        TAG,
+                        "speaker i2s_channel_init_std_mode failed");
+
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_speaker_tx),
+                        TAG,
+                        "speaker i2s_channel_enable failed");
+
+    ESP_LOGI(TAG,
+             "Speaker I2S ready: 16kHz, BCLK=%d, LRC=%d, DOUT=%d",
+             SPK_BCLK_GPIO,
+             SPK_WS_GPIO,
+             SPK_DOUT_GPIO);
+
+    return ESP_OK;
+}
+
 /*
- * 业务命令执行入口。
+ * 把 s_speaker_audio 中 frame_count 帧数据真正写给 I2S1。
+ * 每帧包含 LEFT + RIGHT 两个 int16_t。
+ */
+static esp_err_t speaker_write_frames(size_t frame_count)
+{
+    const size_t bytes_to_write = frame_count * 2U * sizeof(int16_t);
+    size_t bytes_written = 0;
+
+    ESP_RETURN_ON_ERROR(
+        i2s_channel_write(s_speaker_tx,
+                          s_speaker_audio,
+                          bytes_to_write,
+                          &bytes_written,
+                          pdMS_TO_TICKS(1000)),
+        TAG,
+        "speaker i2s_channel_write failed");
+
+    if (bytes_written != bytes_to_write) {
+        ESP_LOGW(TAG,
+                 "Speaker partial write: %u/%u bytes",
+                 (unsigned)bytes_written,
+                 (unsigned)bytes_to_write);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+/* 生成一个范围大约为 [-amplitude, +amplitude] 的伪随机样本。 */
+static int16_t shutter_noise_sample(int32_t amplitude)
+{
+    /* xorshift32：代码很小，足够用于生成“机械咔嚓”的噪声质感。 */
+    uint32_t x = s_shutter_noise_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s_shutter_noise_state = x;
+
+    int32_t centered = (int32_t)(x & 0xFFFFU) - 32768;
+    return (int16_t)((centered * amplitude) / 32768);
+}
+
+/*
+ * 播放一个会快速衰减的噪声脉冲。
+ * 这比播放固定频率的“滴”声更接近机械相机快门的质感。
+ */
+static esp_err_t speaker_play_noise_burst(uint32_t duration_ms,
+                                          int32_t peak_amplitude)
+{
+    const size_t total_frames =
+        ((size_t)SPK_SAMPLE_RATE * duration_ms) / 1000U;
+
+    size_t sent_frames = 0;
+
+    while (sent_frames < total_frames) {
+        size_t frames = total_frames - sent_frames;
+        if (frames > SPK_FRAMES_BLOCK) {
+            frames = SPK_FRAMES_BLOCK;
+        }
+
+        for (size_t i = 0; i < frames; ++i) {
+            size_t position = sent_frames + i;
+            size_t remaining = total_frames - position;
+
+            /* 线性衰减包络：开始最响，随后快速变小。 */
+            int32_t amplitude =
+                (int32_t)((peak_amplitude * (int64_t)remaining) /
+                          (int64_t)total_frames);
+
+            int16_t sample = shutter_noise_sample(amplitude);
+
+            /* 左右声道发送完全相同数据。 */
+            s_speaker_audio[i * 2] = sample;
+            s_speaker_audio[i * 2 + 1] = sample;
+        }
+
+        ESP_RETURN_ON_ERROR(speaker_write_frames(frames),
+                            TAG,
+                            "play shutter noise burst failed");
+
+        sent_frames += frames;
+    }
+
+    return ESP_OK;
+}
+
+/* 播放短暂静音，用来把“咔”和“嚓”两个脉冲分开。 */
+static esp_err_t speaker_play_silence(uint32_t duration_ms)
+{
+    memset(s_speaker_audio, 0, sizeof(s_speaker_audio));
+
+    const size_t total_frames =
+        ((size_t)SPK_SAMPLE_RATE * duration_ms) / 1000U;
+
+    size_t sent_frames = 0;
+
+    while (sent_frames < total_frames) {
+        size_t frames = total_frames - sent_frames;
+        if (frames > SPK_FRAMES_BLOCK) {
+            frames = SPK_FRAMES_BLOCK;
+        }
+
+        ESP_RETURN_ON_ERROR(speaker_write_frames(frames),
+                            TAG,
+                            "play shutter silence failed");
+
+        sent_frames += frames;
+    }
+
+    return ESP_OK;
+}
+
+/*
+ * 播放完整的相机快门音：
+ *
+ *   “咔”  24ms 较强噪声脉冲
+ *     ↓
+ *        14ms 间隔
+ *     ↓
+ *   “嚓”  48ms 较弱噪声脉冲
+ *     ↓
+ *        60ms 静音尾部
+ *
+ * 整体非常短，不会明显拖慢语音交互。
+ */
+static esp_err_t play_camera_shutter_sound(void)
+{
+    if (!s_sound_enabled) {
+        ESP_LOGI(TAG, "SHUTTER SOUND: 当前声音已关闭，跳过播放");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "SHUTTER SOUND: 咔嚓");
+
+    /*
+     * 从这里开始，MIC Task 仍然读取 I2S0，
+     * 但向 AFE 喂 0，避免 Speaker 声音形成自激式误识别。
+     */
+    s_speaker_playing = true;
+
+    esp_err_t err = speaker_play_noise_burst(24, SHUTTER_CLICK_AMPLITUDE);
+
+    if (err == ESP_OK) {
+        err = speaker_play_silence(14);
+    }
+
+    if (err == ESP_OK) {
+        err = speaker_play_noise_burst(48, SHUTTER_CLACK_AMPLITUDE);
+    }
+
+    if (err == ESP_OK) {
+        err = speaker_play_silence(60);
+    }
+
+    /*
+     * 再留约 40ms 的声学尾音保护时间。
+     * 这段时间 MIC 依然向 AFE 喂 0。
+     */
+    vTaskDelay(pdMS_TO_TICKS(40));
+    s_speaker_playing = false;
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SHUTTER SOUND failed: %s", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/* ========================================================================
+ * 7. 业务命令执行入口
+ * ========================================================================
  *
  * 返回 true 表示执行后希望马上退出“连续命令识别”状态，重新等待唤醒词。
  */
@@ -181,7 +451,18 @@ static bool execute_voice_command(int command_id)
         ++s_photo_request_count;
         ESP_LOGI(TAG, "ACTION: 拍照请求 #%lu",
                  (unsigned long)s_photo_request_count);
-        ESP_LOGI(TAG, "说明：当前语音测试暂不调用 Camera，后续可在这里接 capture_one_photo()。");
+
+        /*
+         * 当前还没有真正调用 Camera。
+         * 但命令识别成功以后，会真实通过 MAX98357A 播放“咔嚓”快门音。
+         * 以后接入 capture_one_photo() 后，建议在真正拍照成功之后再播放这里的声音。
+         */
+        if (play_camera_shutter_sound() != ESP_OK) {
+            ESP_LOGW(TAG, "ACTION: 快门音播放失败，但拍照命令仍已被识别");
+        }
+
+        ESP_LOGI(TAG,
+                 "说明：当前语音测试暂不调用 Camera，后续可在这里接 capture_one_photo()。");
         break;
 
     case CMD_START_VIDEO:
@@ -196,12 +477,12 @@ static bool execute_voice_command(int command_id)
 
     case CMD_SOUND_ON:
         s_sound_enabled = true;
-        ESP_LOGI(TAG, "ACTION: 声音状态 -> ON");
+        ESP_LOGI(TAG, "ACTION: 声音状态 -> ON（拍照时会播放快门音）");
         break;
 
     case CMD_SOUND_OFF:
         s_sound_enabled = false;
-        ESP_LOGI(TAG, "ACTION: 声音状态 -> OFF");
+        ESP_LOGI(TAG, "ACTION: 声音状态 -> OFF（拍照时不播放快门音）");
         break;
 
     case CMD_QUERY_STATUS:
@@ -227,7 +508,7 @@ static bool execute_voice_command(int command_id)
 }
 
 /* ========================================================================
- * 5. 初始化 INMP441 I2S RX
+ * 8. 初始化 INMP441 I2S0 RX
  * ======================================================================== */
 static esp_err_t init_mic_i2s(void)
 {
@@ -313,7 +594,7 @@ static esp_err_t mic_read_exact(void *buffer, size_t bytes_to_read)
 }
 
 /* ========================================================================
- * 6. Feed Task：I2S -> 16-bit mono -> AFE
+ * 9. Feed Task：I2S0 -> 16-bit mono -> AFE
  * ======================================================================== */
 static void audio_feed_task(void *arg)
 {
@@ -355,14 +636,23 @@ static void audio_feed_task(void *arg)
 
         int16_t peak = 0;
 
-        for (int i = 0; i < feed_samples; ++i) {
-            /* mic_test 已确认：偶数 slot（LEFT）是真实数据，RIGHT 为 0。 */
-            int16_t sample = mic_sample_to_s16(raw_stereo[i * 2]);
-            mono_s16[i] = sample;
+        if (s_speaker_playing) {
+            /*
+             * Speaker 正在发出快门音。
+             * MIC 仍然持续读取，但这里不给 AFE 喂真实麦克风声音，
+             * 防止“咔嚓”被 WakeNet/MultiNet 当成新的语音输入。
+             */
+            memset(mono_s16, 0, feed_samples * sizeof(int16_t));
+        } else {
+            for (int i = 0; i < feed_samples; ++i) {
+                /* mic_test 已确认：偶数 slot（LEFT）是真实数据，RIGHT 为 0。 */
+                int16_t sample = mic_sample_to_s16(raw_stereo[i * 2]);
+                mono_s16[i] = sample;
 
-            int32_t abs_sample = sample >= 0 ? sample : -(int32_t)sample;
-            if (abs_sample > peak) {
-                peak = (int16_t)abs_sample;
+                int32_t abs_sample = sample >= 0 ? sample : -(int32_t)sample;
+                if (abs_sample > peak) {
+                    peak = (int16_t)abs_sample;
+                }
             }
         }
 
@@ -371,7 +661,10 @@ static void audio_feed_task(void *arg)
 
         /* 每约 100 帧打印一次输入峰值，方便判断麦克风是否持续有数据。 */
         if ((++frame_count % 100) == 0) {
-            ESP_LOGI(TAG, "MIC alive: peak=%d", peak);
+            ESP_LOGI(TAG,
+                     "MIC alive: peak=%d%s",
+                     peak,
+                     s_speaker_playing ? " (speaker guard)" : "");
         }
     }
 
@@ -383,7 +676,7 @@ static void audio_feed_task(void *arg)
 }
 
 /* ========================================================================
- * 7. MultiNet 命令表初始化
+ * 10. MultiNet 命令表初始化
  * ======================================================================== */
 static esp_err_t configure_multinet_commands(void)
 {
@@ -421,7 +714,7 @@ static esp_err_t configure_multinet_commands(void)
 }
 
 /* ========================================================================
- * 8. Detect Task：WakeNet -> MultiNet -> Execute
+ * 11. Detect Task：WakeNet -> MultiNet -> Execute
  * ======================================================================== */
 static void speech_detect_task(void *arg)
 {
@@ -472,6 +765,7 @@ static void speech_detect_task(void *arg)
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
     ESP_LOGI(TAG, "唤醒后可以连续说命令，约 6 秒无有效命令后自动退出命令模式");
+    ESP_LOGI(TAG, "拍照命令会通过 MAX98357A 播放快门音");
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
@@ -551,16 +845,17 @@ static void speech_detect_task(void *arg)
 }
 
 /* ========================================================================
- * 9. app_main
+ * 12. app_main
  * ======================================================================== */
 void app_main(void)
 {
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "ESP32-S3 MIC WAKE + VOICE COMMAND TEST");
-    ESP_LOGI(TAG, "INMP441: BCLK=42 WS=41 DIN=1 (LEFT)");
+    ESP_LOGI(TAG, "ESP32-S3 MIC WAKE + VOICE COMMAND + SHUTTER SOUND TEST");
+    ESP_LOGI(TAG, "INMP441 : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
+    ESP_LOGI(TAG, "Speaker : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
-    ESP_LOGI(TAG, "MultiNet: Chinese offline command recognition");
-    ESP_LOGI(TAG, "Camera / MAX98357A / Speaker 保持物理接线，不需要拔线");
+    ESP_LOGI(TAG, "MultiNet : Chinese offline command recognition");
+    ESP_LOGI(TAG, "Camera / MIC / MAX98357A / Speaker 全部保持物理接线");
     ESP_LOGI(TAG, "====================================================");
 
     /*
@@ -576,7 +871,13 @@ void app_main(void)
                  "如果后面失败，请先根据启动日志确认本板 PSRAM 类型/容量。");
     }
 
+    /*
+     * I2S0：INMP441 RX
+     * I2S1：MAX98357A TX
+     * 两套硬件同时初始化，后面可以边监听语音边播放提示音。
+     */
     ESP_ERROR_CHECK(init_mic_i2s());
+    ESP_ERROR_CHECK(init_speaker_i2s());
 
     /*
      * ESP-SR 会从 partitions.csv 中 label 为 "model" 的分区加载 WakeNet / MultiNet。
@@ -591,6 +892,9 @@ void app_main(void)
     /*
      * input_format="M"：单麦克风输入。
      * 不提供 playback reference，因此当前 AFE 不做双通道 AEC 输入。
+     *
+     * 为了避免快门音回灌，当前采用更简单的测试策略：
+     * Speaker 播放期间，audio_feed_task 临时向 AFE 喂 0。
      */
     afe_config_t *afe_config = afe_config_init("M",
                                                s_models,
@@ -621,7 +925,7 @@ void app_main(void)
 
     /*
      * 两个核心任务分到两个 CPU Core：
-     * Core 0：持续从 I2S 采音并 feed AFE
+     * Core 0：持续从 I2S0 采音并 feed AFE
      * Core 1：fetch AFE 输出并做 WakeNet / MultiNet 推理
      */
     BaseType_t feed_ok = xTaskCreatePinnedToCore(audio_feed_task,
