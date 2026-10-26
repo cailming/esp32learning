@@ -38,6 +38,7 @@ static uint8_t *s_latest_jpeg = NULL;
 static size_t s_latest_jpeg_size = 0;
 static uint16_t s_latest_width = 0;
 static uint16_t s_latest_height = 0;
+static uint32_t s_latest_fingerprint = 0;
 static uint32_t s_sequence = 0;
 static bool s_initialized = false;
 
@@ -48,9 +49,6 @@ static bool s_initialized = false;
  *   buf != NULL
  *   len >= 4
  *   开头为 JPEG SOI：FF D8
- *
- * 不强制要求 framebuffer 最后两个字节恰好是 FF D9，避免某些驱动/帧缓冲
- * 尾部存在填充字节时把一张可用 JPEG 误判为失败。
  */
 static bool jpeg_is_valid(const camera_fb_t *fb)
 {
@@ -60,6 +58,29 @@ static bool jpeg_is_valid(const camera_fb_t *fb)
            && fb->len >= 4
            && fb->buf[0] == 0xFF
            && fb->buf[1] == 0xD8;
+}
+
+/*
+ * 对整张 JPEG 计算一个轻量内容指纹。
+ *
+ * 目的不是加密，而是让串口日志可以明确回答：
+ * “Camera 抓到的这一帧、内存里保存的这一帧、HTTP 发出去的这一帧，
+ *  到底是不是同一份 JPEG？”
+ */
+static uint32_t jpeg_fingerprint(const uint8_t *data, size_t size)
+{
+    uint32_t hash = 2166136261u;  // FNV-1a offset basis
+
+    if (data == NULL) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+
+    return hash;
 }
 
 static uint8_t *allocate_jpeg_buffer(size_t size)
@@ -129,7 +150,7 @@ esp_err_t camera_capture_init(void)
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != NULL) {
         ESP_LOGI(TAG,
-                 "Camera ready: PID=0x%04x VER=0x%02x, QVGA JPEG quality=12",
+                 "Camera ready: PID=0x%04x VER=0x%02x, frame_size=VGA, JPEG quality=12, fb_count=1, grab=WHEN_EMPTY",
                  sensor->id.PID,
                  sensor->id.VER);
     } else {
@@ -137,16 +158,19 @@ esp_err_t camera_capture_init(void)
     }
 
     /*
-     * 某些 Camera 上电后的第一帧可能不稳定。
-     * 预热抓取一帧并立即归还，正式“拍照”从下一帧开始。
+     * 上电预热只负责丢掉初始化阶段可能不稳定的第一帧。
+     * 注意：由于 grab_mode=CAMERA_GRAB_WHEN_EMPTY，驱动后续仍可能提前把一帧
+     * 填进唯一 framebuffer。所以每次正式拍照还会再做一次“丢弃缓存帧”。
      */
     camera_fb_t *warmup = esp_camera_fb_get();
     if (warmup != NULL) {
+        uint32_t warmup_fp = jpeg_fingerprint(warmup->buf, warmup->len);
         ESP_LOGI(TAG,
-                 "Camera warm-up frame: %ux%u, %u bytes",
+                 "INIT warm-up discard: %ux%u, %u bytes, fp=%08lx",
                  (unsigned)warmup->width,
                  (unsigned)warmup->height,
-                 (unsigned)warmup->len);
+                 (unsigned)warmup->len,
+                 (unsigned long)warmup_fp);
         esp_camera_fb_return(warmup);
     } else {
         ESP_LOGW(TAG, "Camera warm-up frame failed; continue anyway");
@@ -162,29 +186,77 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * 非常关键：先主动取走并丢弃当前 framebuffer 中可能已经缓存的旧帧。
+     *
+     * Espressif 对 CAMERA_GRAB_WHEN_EMPTY 的说明明确指出：
+     * “first fb_count frames might be old”。当前 fb_count=1，因此如果直接把
+     * 第一次 esp_camera_fb_get() 当成“本次拍照”，就可能出现整整慢一拍：
+     * 第一次命令拿到旧帧，归还以后驱动才抓新帧；第二次命令才看到上一轮画面。
+     *
+     * 这里保持 fb_count=1（避免增加内存），用“丢一帧 + 正式抓一帧”解决。
+     */
+    ESP_LOGI(TAG, "CAPTURE STEP 1/2: flush possible buffered frame...");
+
+    uint32_t discarded_fp = 0;
+    camera_fb_t *discarded = esp_camera_fb_get();
+    if (discarded != NULL) {
+        discarded_fp = jpeg_fingerprint(discarded->buf, discarded->len);
+        ESP_LOGI(TAG,
+                 "CAPTURE STEP 1/2: discarded frame %ux%u, %u bytes, fp=%08lx, valid=%s",
+                 (unsigned)discarded->width,
+                 (unsigned)discarded->height,
+                 (unsigned)discarded->len,
+                 (unsigned long)discarded_fp,
+                 jpeg_is_valid(discarded) ? "YES" : "NO");
+        esp_camera_fb_return(discarded);
+    } else {
+        /* 丢弃帧失败不直接判本次拍照失败，继续尝试真正抓一帧。 */
+        ESP_LOGW(TAG, "CAPTURE STEP 1/2: no buffered frame returned; continue fresh capture");
+    }
+
+    ESP_LOGI(TAG, "CAPTURE STEP 2/2: waiting for fresh frame...");
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == NULL) {
-        ESP_LOGE(TAG, "Capture failed: esp_camera_fb_get returned NULL");
+        ESP_LOGE(TAG, "CAPTURE STEP 2/2 failed: esp_camera_fb_get returned NULL");
         return ESP_FAIL;
     }
 
     esp_err_t err = ESP_OK;
     uint8_t *new_jpeg = NULL;
+    const uint32_t fresh_fp = jpeg_fingerprint(fb->buf, fb->len);
+
+    ESP_LOGI(TAG,
+             "CAPTURE STEP 2/2: fresh frame %ux%u, %u bytes, fp=%08lx, valid=%s",
+             (unsigned)fb->width,
+             (unsigned)fb->height,
+             (unsigned)fb->len,
+             (unsigned long)fresh_fp,
+             jpeg_is_valid(fb) ? "YES" : "NO");
+
+    if (discarded_fp != 0 && fresh_fp == discarded_fp) {
+        ESP_LOGW(TAG,
+                 "CAPTURE diagnostic: discarded and fresh fingerprint are identical (%08lx). "
+                 "If the scene did not move this can be normal; if scene changed, please keep this log.",
+                 (unsigned long)fresh_fp);
+    }
 
     if (!jpeg_is_valid(fb)) {
         ESP_LOGE(TAG,
-                 "Capture failed: invalid JPEG, format=%d %ux%u len=%u",
+                 "Capture failed: invalid fresh JPEG, format=%d %ux%u len=%u fp=%08lx",
                  (int)fb->format,
                  (unsigned)fb->width,
                  (unsigned)fb->height,
-                 (unsigned)fb->len);
+                 (unsigned)fb->len,
+                 (unsigned long)fresh_fp);
         err = ESP_ERR_INVALID_RESPONSE;
         goto out;
     }
 
     /*
-     * fb->buf 属于 Camera 驱动，esp_camera_fb_return() 以后不能再使用。
-     * 因此这里复制一份，作为业务层真正的“最新照片”。
+     * fb->buf 属于 Camera 驱动，esp_camera_fb_return() 以后不能继续使用。
+     * 因此复制一份，作为业务层真正的“最新照片”。
      */
     new_jpeg = allocate_jpeg_buffer(fb->len);
     if (new_jpeg == NULL) {
@@ -210,10 +282,13 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
     xSemaphoreTake(s_photo_mutex, portMAX_DELAY);
 
     uint8_t *old_jpeg = s_latest_jpeg;
+    const uint32_t old_fp = s_latest_fingerprint;
+
     s_latest_jpeg = new_jpeg;
     s_latest_jpeg_size = new_size;
     s_latest_width = new_width;
     s_latest_height = new_height;
+    s_latest_fingerprint = fresh_fp;
     ++s_sequence;
 
     if (info != NULL) {
@@ -221,6 +296,7 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
         info->width = s_latest_width;
         info->height = s_latest_height;
         info->jpeg_size = s_latest_jpeg_size;
+        info->fingerprint = s_latest_fingerprint;
     }
 
     const uint32_t sequence = s_sequence;
@@ -230,11 +306,13 @@ esp_err_t camera_capture_one(camera_photo_info_t *info)
     new_jpeg = NULL;
 
     ESP_LOGI(TAG,
-             "PHOTO CAPTURED: #%lu %ux%u JPEG %u bytes",
+             "LATEST PHOTO REPLACED: #%lu %ux%u %u bytes fp=%08lx (previous fp=%08lx)",
              (unsigned long)sequence,
              (unsigned)new_width,
              (unsigned)new_height,
-             (unsigned)new_size);
+             (unsigned)new_size,
+             (unsigned long)fresh_fp,
+             (unsigned long)old_fp);
 
 out:
     if (fb != NULL) {
@@ -306,6 +384,7 @@ esp_err_t camera_capture_copy_latest(uint8_t **jpeg_copy,
         info->width = s_latest_width;
         info->height = s_latest_height;
         info->jpeg_size = s_latest_jpeg_size;
+        info->fingerprint = s_latest_fingerprint;
     }
 
     xSemaphoreGive(s_photo_mutex);
