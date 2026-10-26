@@ -1,17 +1,12 @@
 # -----------------------------------------------------------------------------
 # 真实相机快门 WAV
 # -----------------------------------------------------------------------------
-#
 # 第一次配置工程时，从固定 commit 下载 Mozilla / Firefox DevTools 使用的
 # shutter.wav，然后通过 EMBED_FILES 原样打进 ESP32 固件。
 #
-# 这里故意把 WAV 放在当前组件根目录，而不是 sounds/ 子目录：
-# 这样 ESP-IDF 生成的链接符号固定为：
-#
+# WAV 放在组件根目录，生成固定链接符号：
 #   _binary_shutter_wav_start
 #   _binary_shutter_wav_end
-#
-# 可以避免不同 ESP-IDF 版本对带路径 EMBED_FILES 的符号命名差异。
 #
 set(SHUTTER_SOUND_FILE "${CMAKE_CURRENT_LIST_DIR}/shutter.wav")
 set(SHUTTER_SOUND_URL
@@ -44,9 +39,17 @@ idf_component_register(
         "main.c"
         "camera_capture.c"
         "shutter_wav_player.c"
+        "photo_http_server.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_i2s
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_server
+        nvs_flash
     EMBED_FILES
         "shutter.wav"
+    EMBED_TXTFILES
+        "web/index.html"
 )
