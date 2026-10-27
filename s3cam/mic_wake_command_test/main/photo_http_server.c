@@ -34,6 +34,45 @@ extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 static bool s_started = false;
 static httpd_handle_t s_server = NULL;
 
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+static volatile bool s_sta_has_ip = false;
+
+static void wifi_uplink_event_handler(void *arg,
+                                      esp_event_base_t event_base,
+                                      int32_t event_id,
+                                      void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "STA uplink starting -> connect to %s", CONFIG_TTS_WIFI_STA_SSID);
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_sta_has_ip = false;
+        ESP_LOGW(TAG, "STA uplink disconnected, reconnecting...");
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "STA reconnect failed: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
+        s_sta_has_ip = true;
+        ESP_LOGI(TAG,
+                 "STA uplink GOT IP: " IPSTR,
+                 IP2STR(&event->ip_info.ip));
+    }
+}
+#endif
+
 /* HTTP 端再独立算一次 JPEG 指纹，用来核对复制出来的数据是否和 Camera 保存的一致。 */
 static uint32_t jpeg_fingerprint(const uint8_t *data, size_t size)
 {
@@ -76,7 +115,7 @@ static esp_err_t init_nvs_for_wifi(void)
     return err;
 }
 
-static esp_err_t start_wifi_ap(void)
+static esp_err_t start_wifi(void)
 {
     ESP_RETURN_ON_ERROR(init_nvs_for_wifi(), TAG, "NVS init failed");
 
@@ -97,6 +136,13 @@ static esp_err_t start_wifi_ap(void)
         return ESP_FAIL;
     }
 
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    if (esp_netif_create_default_wifi_sta() == NULL) {
+        ESP_LOGE(TAG, "esp_netif_create_default_wifi_sta failed");
+        return ESP_FAIL;
+    }
+#endif
+
     /*
      * Wi-Fi 的静态 RX buffer 主要必须从内部 RAM / DMA-capable RAM 申请。
      * 如果这里 internal / largest_internal 太低，就会出现：
@@ -116,28 +162,70 @@ static esp_err_t start_wifi_ap(void)
 
     log_memory("after esp_wifi_init OK");
 
-    wifi_config_t wifi_config = {0};
+    wifi_config_t ap_config = {0};
 
-    strlcpy((char *)wifi_config.ap.ssid,
+    strlcpy((char *)ap_config.ap.ssid,
             AP_SSID,
-            sizeof(wifi_config.ap.ssid));
-    strlcpy((char *)wifi_config.ap.password,
+            sizeof(ap_config.ap.ssid));
+    strlcpy((char *)ap_config.ap.password,
             AP_PASSWORD,
-            sizeof(wifi_config.ap.password));
+            sizeof(ap_config.ap.password));
 
-    wifi_config.ap.ssid_len = strlen(AP_SSID);
-    wifi_config.ap.channel = AP_CHANNEL;
-    wifi_config.ap.max_connection = AP_MAX_CLIENT;
-    wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.ap.pmf_cfg.capable = true;
-    wifi_config.ap.pmf_cfg.required = false;
+    ap_config.ap.ssid_len = strlen(AP_SSID);
+    ap_config.ap.channel = AP_CHANNEL;
+    ap_config.ap.max_connection = AP_MAX_CLIENT;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.pmf_cfg.capable = true;
+    ap_config.ap.pmf_cfg.required = false;
 
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    if (strlen(CONFIG_TTS_WIFI_STA_SSID) == 0U) {
+        ESP_LOGE(TAG,
+                 "TTS_WIFI_STA_ENABLE=y but uplink SSID is empty; configure it in menuconfig");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(
+        esp_event_handler_register(WIFI_EVENT,
+                                   ESP_EVENT_ANY_ID,
+                                   &wifi_uplink_event_handler,
+                                   NULL),
+        TAG,
+        "register Wi-Fi event handler failed");
+    ESP_RETURN_ON_ERROR(
+        esp_event_handler_register(IP_EVENT,
+                                   IP_EVENT_STA_GOT_IP,
+                                   &wifi_uplink_event_handler,
+                                   NULL),
+        TAG,
+        "register IP event handler failed");
+
+    wifi_config_t sta_config = {0};
+    strlcpy((char *)sta_config.sta.ssid,
+            CONFIG_TTS_WIFI_STA_SSID,
+            sizeof(sta_config.sta.ssid));
+    strlcpy((char *)sta_config.sta.password,
+            CONFIG_TTS_WIFI_STA_PASSWORD,
+            sizeof(sta_config.sta.password));
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_APSTA),
+                        TAG,
+                        "esp_wifi_set_mode APSTA failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config),
+                        TAG,
+                        "esp_wifi_set_config AP failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_config),
+                        TAG,
+                        "esp_wifi_set_config STA failed");
+#else
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP),
                         TAG,
-                        "esp_wifi_set_mode failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_config),
+                        "esp_wifi_set_mode AP failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config),
                         TAG,
-                        "esp_wifi_set_config failed");
+                        "esp_wifi_set_config AP failed");
+#endif
+
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start failed");
 
     ESP_LOGI(TAG, "Wi-Fi SoftAP started");
@@ -145,6 +233,15 @@ static esp_err_t start_wifi_ap(void)
     ESP_LOGI(TAG, "Password : %s", AP_PASSWORD);
     ESP_LOGI(TAG, "Web      : http://192.168.4.1/");
     ESP_LOGI(TAG, "Photo    : http://192.168.4.1/photo.jpg");
+
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    ESP_LOGI(TAG,
+             "STA uplink enabled: connecting to %s (SoftAP remains active)",
+             CONFIG_TTS_WIFI_STA_SSID);
+#else
+    ESP_LOGI(TAG,
+             "STA uplink disabled; enable it in menuconfig if ChatTTS is on your LAN");
+#endif
 
     return ESP_OK;
 }
@@ -316,7 +413,7 @@ esp_err_t photo_http_server_start(void)
         return ESP_OK;
     }
 
-    ESP_RETURN_ON_ERROR(start_wifi_ap(), TAG, "SoftAP start failed");
+    ESP_RETURN_ON_ERROR(start_wifi(), TAG, "Wi-Fi start failed");
     ESP_RETURN_ON_ERROR(start_http_server(), TAG, "HTTP server start failed");
 
     s_started = true;
@@ -326,6 +423,9 @@ esp_err_t photo_http_server_start(void)
     ESP_LOGI(TAG, "1) Connect Wi-Fi: %s", AP_SSID);
     ESP_LOGI(TAG, "2) Password      : %s", AP_PASSWORD);
     ESP_LOGI(TAG, "3) Open browser  : http://192.168.4.1/");
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    ESP_LOGI(TAG, "4) TTS uplink    : AP+STA -> %s", CONFIG_TTS_WIFI_STA_SSID);
+#endif
     ESP_LOGI(TAG, "====================================================");
 
     return ESP_OK;
