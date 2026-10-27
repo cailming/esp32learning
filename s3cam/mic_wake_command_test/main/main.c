@@ -1,33 +1,25 @@
 /*
  * ESP32-S3-CAM：Camera + INMP441 + ESP-SR + MAX98357A + ChatTTS
  *
- * 主要链路：
- *   “你好小智” -> WakeNet10 -> MultiNet6
+ * 当前总体架构：
+ *
+ *   INMP441 -> I2S0 -> audio_feed_task -> ESP-SR AFE
+ *                                      -> speech_detect_task
+ *                                      -> WakeNet / MultiNet
  *
  *   “拍照”
- *      -> OV3660 抓拍 JPEG
- *      -> 保存最新照片
- *      -> 播放真实 shutter.wav
+ *      -> camera_capture_one()
+ *      -> 保存 JPEG
+ *      -> 同步播放 shutter.wav
  *
  *   “状态查询”
- *      -> 生成简短状态文本
- *      -> POST ChatTTS /tts/stream
- *      -> 接收 24kHz / PCM16 / mono
- *      -> I2S1 临时切换到 24kHz
- *      -> mono 复制为 stereo -> MAX98357A
+ *      -> speech_detect_task 只生成状态文本并投递到 TTS Queue
+ *      -> tts_service_task 独立执行 HTTP / ChatTTS
+ *      -> tts_client 内部再使用 PSRAM StreamBuffer + tts_pcm_play_task
+ *      -> I2S1 -> MAX98357A
  *
- * 已验证硬件接线：
- *   Camera：板载 OV3660，GPIO 见 camera_capture.c
- *   INMP441 SCK/BCLK -> GPIO42
- *   INMP441 WS/LRCLK -> GPIO41
- *   INMP441 SD       -> GPIO1
- *   INMP441 L/R      -> GND（LEFT channel）
- *
- *   MAX98357A BCLK   -> GPIO14
- *   MAX98357A LRC    -> GPIO3
- *   MAX98357A DIN    -> GPIO46
- *   MAX98357A VIN    -> 5V
- *   MAX98357A GND    -> 公共 GND
+ * 这样语音识别、TTS 网络请求、PCM 播放三层互相解耦，speech_detect_task
+ * 不再因为一次 HTTP/TTS 播放而长时间阻塞。
  */
 
 #include <assert.h>
@@ -60,7 +52,7 @@
 #include "camera_capture.h"
 #include "photo_http_server.h"
 #include "shutter_wav_player.h"
-#include "tts_client.h"
+#include "tts_service.h"
 
 #if !CONFIG_IDF_TARGET_ESP32S3
 #error "mic_wake_command_test 只用于 ESP32-S3，请先执行 idf.py set-target esp32s3"
@@ -93,11 +85,15 @@ static i2s_chan_handle_t s_speaker_tx = NULL;
 static SemaphoreHandle_t s_speaker_mutex = NULL;
 
 /*
- * Speaker 播放期间置 true。
- * audio_feed_task 仍持续从 I2S0 读取 MIC，避免 RX DMA 堵住；
- * 但暂停向 AFE feed()，因为 speech_detect_task 此时正在同步执行 TTS，
- * 不会调用 fetch()。如果仍继续 feed，会把 AFE ringbuffer 灌满，产生大量
- * warning，并明显干扰 Wi-Fi/HTTP/I2S 实时播放。
+ * Speaker guard：只要快门音或 TTS 正在等待/使用 Speaker，就保持 true。
+ *
+ * audio_feed_task 在 guard=true 时仍持续读取 MIC I2S0，避免 RX DMA 堵住，
+ * 但暂停向 AFE feed()：
+ *   1. 防止扬声器声音被麦克风再次拾取后回灌 WakeNet/MultiNet；
+ *   2. TTS 期间 speech_detect_task 最终会阻塞在 AFE fetch，暂停 feed 可以避免
+ *      AFE ringbuffer 再次被灌满。
+ *
+ * tts_service_enqueue() 会在请求一入队时立即把它置 true，而不是等到真正开声后。
  */
 static volatile bool s_speaker_playing = false;
 
@@ -203,9 +199,11 @@ static esp_err_t init_speaker_i2s(void)
                         TAG,
                         "speaker i2s_channel_init_std_mode failed");
 
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_speaker_tx),
-                        TAG,
-                        "speaker i2s_channel_enable failed");
+    /*
+     * 初始化完成后不立即 enable。
+     * TTS/快门真正播放前会自行：disable(允许已停) -> reconfig clock -> enable。
+     * 空闲时不输出无意义 I2S 时钟，也避免 MAX98357A 空转产生杂音。
+     */
 
     s_speaker_mutex = xSemaphoreCreateMutex();
     if (s_speaker_mutex == NULL) {
@@ -214,7 +212,7 @@ static esp_err_t init_speaker_i2s(void)
     }
 
     ESP_LOGI(TAG,
-             "Speaker I2S ready: 16kHz idle, BCLK=%d, LRC=%d, DOUT=%d",
+             "Speaker I2S configured: idle=disabled, BCLK=%d, LRC=%d, DOUT=%d",
              SPK_BCLK_GPIO,
              SPK_WS_GPIO,
              SPK_DOUT_GPIO);
@@ -265,10 +263,14 @@ static esp_err_t play_camera_shutter_sound(void)
     return err;
 }
 
-static esp_err_t play_tts_text(const char *text)
+/*
+ * 状态查询不再在 speech_detect_task 内同步执行 HTTP/TTS。
+ * 这里只做快速入队，真正播放由常驻 tts_service_task 完成。
+ */
+static esp_err_t queue_tts_text(const char *text)
 {
     if (!s_sound_enabled) {
-        ESP_LOGI(TAG, "TTS: 当前声音已关闭，不播放状态播报");
+        ESP_LOGI(TAG, "TTS: 当前声音已关闭，不投递状态播报");
         return ESP_OK;
     }
 
@@ -279,24 +281,13 @@ static esp_err_t play_tts_text(const char *text)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!speaker_lock()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "TTS: begin -> %s", CONFIG_TTS_SERVER_URL);
-    s_speaker_playing = true;
-
-    esp_err_t err = tts_client_play(s_speaker_tx,
-                                    CONFIG_TTS_SERVER_URL,
-                                    text);
-
-    /* 同样保留一点尾音保护时间，避免恢复识别时立刻吃到扬声器残响。 */
-    vTaskDelay(pdMS_TO_TICKS(120));
-    s_speaker_playing = false;
-    speaker_unlock();
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TTS playback failed: %s", esp_err_to_name(err));
+    esp_err_t err = tts_service_enqueue(text);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "TTS: 已异步入队，speech_detect_task 不等待播放完成");
+    } else {
+        ESP_LOGE(TAG,
+                 "TTS enqueue failed: %s",
+                 esp_err_to_name(err));
     }
     return err;
 }
@@ -404,18 +395,22 @@ static bool execute_voice_command(int command_id)
                          s_sound_enabled ? "已开启" : "已关闭");
 
         if (n > 0 && n < (int)sizeof(status_text)) {
-            esp_err_t tts_err = play_tts_text(status_text);
+            esp_err_t tts_err = queue_tts_text(status_text);
             if (tts_err != ESP_OK) {
                 ESP_LOGW(TAG,
-                         "ACTION: 状态已打印，但 TTS 播报失败: %s",
+                         "ACTION: 状态已打印，但 TTS 入队失败: %s",
                          esp_err_to_name(tts_err));
             }
         } else {
             ESP_LOGE(TAG, "ACTION: status text build failed");
         }
 
-        /* TTS 播放后清理 MultiNet，避免 Speaker 尾音影响下一条命令。 */
-        ESP_LOGI(TAG, "ACTION: 状态查询结束，重新等待唤醒词");
+        /*
+         * TTS 已经交给独立 worker；这里立即清理 MultiNet 并返回。
+         * 由于 enqueue 时 speaker guard 已经置 true，audio_feed_task 会暂停 feed，
+         * 所以即使 WakeNet 重新 enable，也不会把正在播放的 TTS 回灌进去。
+         */
+        ESP_LOGI(TAG, "ACTION: 状态查询已入队，立即退出命令模式");
         ESP_LOGI(TAG, "====================================================");
         return true;
     }
@@ -544,11 +539,6 @@ static void audio_feed_task(void *arg)
             break;
         }
 
-        /*
-         * Speaker 正在播放时 speech_detect_task 会同步阻塞在 TTS/快门播放中，
-         * 此时没有消费者调用 AFE fetch()。继续 feed 即使喂 0 也会把 ringbuffer
-         * 灌满并持续刷 warning。因此只保持 MIC I2S 读取，不再向 AFE 投递数据。
-         */
         if (s_speaker_playing) {
             if ((++frame_count % 100) == 0) {
                 ESP_LOGI(TAG, "MIC alive: speaker guard, AFE feed paused");
@@ -661,7 +651,7 @@ static void speech_detect_task(void *arg)
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
     ESP_LOGI(TAG, "唤醒后可以说：拍照 / 开始录像 / 状态查询 ...");
-    ESP_LOGI(TAG, "状态查询：通过 ChatTTS 服务器实时流式播报");
+    ESP_LOGI(TAG, "状态查询：异步投递到独立 TTS service task");
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
@@ -740,15 +730,17 @@ static void speech_detect_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ChatTTS + WEB");
-    ESP_LOGI(TAG, "Camera  : OV3660 / QVGA JPEG / real capture");
-    ESP_LOGI(TAG, "INMP441 : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
-    ESP_LOGI(TAG, "Speaker : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
+    ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ASYNC ChatTTS + WEB");
+    ESP_LOGI(TAG, "Camera   : OV3660 / VGA JPEG / real capture");
+    ESP_LOGI(TAG, "INMP441  : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
+    ESP_LOGI(TAG, "Speaker  : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
-    ESP_LOGI(TAG, "Web     : S3CAM-Photo -> http://192.168.4.1/");
+    ESP_LOGI(TAG, "Web      : S3CAM-Photo -> http://192.168.4.1/");
     ESP_LOGI(TAG,
-             "TTS     : %s",
-             strlen(CONFIG_TTS_SERVER_URL) > 0U ? CONFIG_TTS_SERVER_URL : "(not configured)");
+             "TTS      : %s",
+             strlen(CONFIG_TTS_SERVER_URL) > 0U
+                 ? CONFIG_TTS_SERVER_URL
+                 : "(not configured)");
     ESP_LOGI(TAG, "====================================================");
 
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -757,19 +749,31 @@ void app_main(void)
     if (psram_free == 0) {
         ESP_LOGW(TAG,
                  "当前没有可用 PSRAM；最新 JPEG 会回退到内部内存，"
-                 "WakeNet + MultiNet + Wi-Fi 也可能受内存限制影响。");
+                 "WakeNet + MultiNet + Wi-Fi + TTS Buffer 也可能受内存限制影响。");
     }
 
+    /* 核心硬件。 */
     ESP_ERROR_CHECK(camera_capture_init());
     ESP_ERROR_CHECK(init_mic_i2s());
     ESP_ERROR_CHECK(init_speaker_i2s());
 
+    /*
+     * 启动常驻 TTS service。它此时只阻塞等待 Queue，不会主动访问网络。
+     * 状态查询发生时，speech_detect_task 只负责 enqueue。
+     */
+    ESP_ERROR_CHECK(tts_service_start(s_speaker_tx,
+                                      CONFIG_TTS_SERVER_URL,
+                                      s_speaker_mutex,
+                                      &s_speaker_playing));
+
+    /* 从 model 分区加载 WakeNet10 / MultiNet6。 */
     s_models = esp_srmodel_init("model");
     if (s_models == NULL) {
         ESP_LOGE(TAG, "esp_srmodel_init(model) failed");
         return;
     }
 
+    /* 单麦克风输入，不提供 playback reference。 */
     afe_config_t *afe_config = afe_config_init("M",
                                                s_models,
                                                AFE_TYPE_SR,
@@ -804,9 +808,13 @@ void app_main(void)
                                                  NULL,
                                                  0);
 
+    /*
+     * 之前 speech_detect_task 同步承载 HTTP/TTS，所以给了 14KB 栈。
+     * 现在它只做 ESP-SR + 业务调度，恢复到更合理的 10KB。
+     */
     BaseType_t detect_ok = xTaskCreatePinnedToCore(speech_detect_task,
                                                    "speech_detect",
-                                                   14 * 1024,
+                                                   10 * 1024,
                                                    s_afe_data,
                                                    5,
                                                    NULL,
@@ -818,6 +826,11 @@ void app_main(void)
         return;
     }
 
+    /*
+     * 最后启动 Wi-Fi + Photo HTTP Server。
+     * 若 menuconfig 开启 STA uplink，则保持 S3CAM-Photo SoftAP 的同时接入局域网，
+     * 供 TTS service 访问 RTX3090。
+     */
     ESP_ERROR_CHECK(photo_http_server_start());
 
     ESP_LOGI(TAG, "====================================================");
@@ -826,7 +839,9 @@ void app_main(void)
     ESP_LOGI(TAG, "Wi-Fi : S3CAM-Photo / 12345678");
     ESP_LOGI(TAG, "Web   : http://192.168.4.1/");
     ESP_LOGI(TAG,
-             "TTS   : %s",
-             strlen(CONFIG_TTS_SERVER_URL) > 0U ? CONFIG_TTS_SERVER_URL : "disabled until configured");
+             "TTS   : async service -> %s",
+             strlen(CONFIG_TTS_SERVER_URL) > 0U
+                 ? CONFIG_TTS_SERVER_URL
+                 : "disabled until configured");
     ESP_LOGI(TAG, "====================================================");
 }
