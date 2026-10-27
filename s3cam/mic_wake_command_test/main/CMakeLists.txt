@@ -40,6 +40,7 @@ idf_component_register(
         "camera_capture.c"
         "shutter_wav_player.c"
         "photo_http_server.c"
+        "tts_client.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_i2s
@@ -47,6 +48,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_http_server
+        esp_http_client
         nvs_flash
     EMBED_FILES
         "shutter.wav"
