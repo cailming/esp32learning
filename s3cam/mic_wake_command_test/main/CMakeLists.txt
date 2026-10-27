@@ -50,6 +50,8 @@ idf_component_register(
         esp_http_server
         esp_http_client
         nvs_flash
+    PRIV_REQUIRES
+        esp_timer
     EMBED_FILES
         "shutter.wav"
     EMBED_TXTFILES
