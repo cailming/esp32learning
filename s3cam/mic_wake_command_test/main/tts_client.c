@@ -10,15 +10,29 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "tts_client";
 
-#define TTS_SAMPLE_RATE            24000U
-#define SPEAKER_IDLE_SAMPLE_RATE   16000U
-#define HTTP_RX_BUFFER_SIZE        2048U
-#define JSON_BODY_SIZE             512U
-#define TTS_URL_BUFFER_SIZE        256U
-#define HTTP_TIMEOUT_MS            10000
+#define TTS_SAMPLE_RATE             24000U
+#define SPEAKER_IDLE_SAMPLE_RATE    16000U
+#define HTTP_RX_BUFFER_SIZE         2048U
+#define JSON_BODY_SIZE              512U
+#define TTS_URL_BUFFER_SIZE         256U
+#define HTTP_TIMEOUT_MS             10000
+
+/*
+ * TTS 结束后不能立刻把 I2S1 从 24kHz 切回 16kHz。
+ * i2s_channel_write() 返回时，最后一批样本可能仍在 DMA 中等待真正送完。
+ * 如果此时 disable -> reconfig -> enable，DMA 中残留的非零语音数据可能在
+ * 新时钟下继续/重复输出，MAX98357A 听起来就会像“嘀嗒/机关枪”。
+ *
+ * 因此结束时先在 24kHz 下写入一段全 0 PCM，让 DMA 尾部被静音覆盖，
+ * 再额外等待一小段时间确保这些 0 真正移出 I2S，最后才恢复 16kHz。
+ */
+#define TTS_TAIL_SILENCE_MS         120U
+#define TTS_DMA_DRAIN_GUARD_MS       80U
+#define SILENCE_FRAMES_PER_BLOCK    256U
 
 /*
  * HTTP 一次最多读取 2048 bytes mono PCM，也就是 1024 个 int16 sample。
@@ -26,6 +40,9 @@ static const char *TAG = "tts_client";
  * 所以这里预留 1025 frame。I2S 使用 stereo framing，因此 *2。
  */
 static int16_t s_stereo_output[(HTTP_RX_BUFFER_SIZE / 2U + 1U) * 2U];
+
+/* 静态区自动清零，专门用于 TTS 尾部把 DMA 内容刷成静音。 */
+static int16_t s_silence_output[SILENCE_FRAMES_PER_BLOCK * 2U];
 
 static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                                          uint32_t sample_rate)
@@ -86,6 +103,54 @@ static esp_err_t i2s_write_all(i2s_chan_handle_t tx_chan,
         }
         offset += written;
     }
+
+    return ESP_OK;
+}
+
+/*
+ * 在仍保持 24kHz 的情况下向 I2S1 写足够长的 stereo silence。
+ * 这不是给 TTS 音频“补静音文件”，而是专门用来覆盖 DMA 尾部缓存。
+ */
+static esp_err_t speaker_flush_tts_tail(i2s_chan_handle_t tx_chan)
+{
+    const size_t total_frames =
+        ((size_t)TTS_SAMPLE_RATE * TTS_TAIL_SILENCE_MS) / 1000U;
+    size_t frames_left = total_frames;
+
+    ESP_LOGI(TAG,
+             "Flush TTS tail with %u ms silence before clock restore",
+             (unsigned)TTS_TAIL_SILENCE_MS);
+
+    while (frames_left > 0U) {
+        size_t frames = frames_left;
+        if (frames > SILENCE_FRAMES_PER_BLOCK) {
+            frames = SILENCE_FRAMES_PER_BLOCK;
+        }
+
+        const size_t bytes = frames * 2U * sizeof(int16_t);
+        esp_err_t err = i2s_write_all(tx_chan,
+                                      (const uint8_t *)s_silence_output,
+                                      bytes);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG,
+                     "write TTS tail silence failed: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        frames_left -= frames;
+    }
+
+    /*
+     * i2s_channel_write() 只保证数据交给驱动/DMA，不代表最后一个 sample 已经
+     * 从引脚发完。再等一段 guard，让 DMA 中剩余的静音真正移出。
+     */
+    vTaskDelay(pdMS_TO_TICKS(TTS_DMA_DRAIN_GUARD_MS));
+
+    ESP_LOGI(TAG,
+             "TTS tail drained: silence=%u ms guard=%u ms",
+             (unsigned)TTS_TAIL_SILENCE_MS,
+             (unsigned)TTS_DMA_DRAIN_GUARD_MS);
 
     return ESP_OK;
 }
@@ -472,6 +537,15 @@ cleanup:
     esp_http_client_cleanup(client);
 
     if (speaker_clock_changed) {
+        /*
+         * 关键：不要在最后一包语音刚写入 DMA 后立刻切时钟。
+         * 先用全 0 静音把 DMA 尾部覆盖并等待排空，再恢复 16kHz。
+         */
+        esp_err_t tail_err = speaker_flush_tts_tail(tx_chan);
+        if (err == ESP_OK && tail_err != ESP_OK) {
+            err = tail_err;
+        }
+
         esp_err_t restore_err = speaker_set_sample_rate(tx_chan,
                                                         SPEAKER_IDLE_SAMPLE_RATE);
         if (err == ESP_OK && restore_err != ESP_OK) {
