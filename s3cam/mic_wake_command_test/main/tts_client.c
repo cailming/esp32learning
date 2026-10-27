@@ -17,6 +17,7 @@ static const char *TAG = "tts_client";
 #define SPEAKER_IDLE_SAMPLE_RATE   16000U
 #define HTTP_RX_BUFFER_SIZE        2048U
 #define JSON_BODY_SIZE             512U
+#define TTS_URL_BUFFER_SIZE        256U
 #define HTTP_TIMEOUT_MS            10000
 
 /*
@@ -89,6 +90,95 @@ static esp_err_t i2s_write_all(i2s_chan_handle_t tx_chan,
     return ESP_OK;
 }
 
+/*
+ * menuconfig 中粘贴 URL 时，尤其从浏览器/聊天窗口复制，前后偶尔会带：
+ *   - 普通空格 / Tab / CR / LF
+ *   - UTF-8 NBSP（C2 A0，不换行空格）
+ *
+ * esp_http_client 的 URL parser 对这些前缀非常严格，会直接报：
+ *   Error parse url
+ *   Failed to set URL
+ *
+ * 因此这里先做一层小型规范化：
+ *   1. 跳过开头的 ASCII 空白和 UTF-8 NBSP；
+ *   2. 从 http:// 或 https:// 开始复制；
+ *   3. 遇到结尾空白即停止；
+ *   4. 再检查 scheme，避免把坏配置误报成 ESP_ERR_NO_MEM。
+ */
+static bool is_ascii_space(uint8_t c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+static const char *skip_leading_url_space(const char *p)
+{
+    while (*p != '\0') {
+        const uint8_t c0 = (uint8_t)p[0];
+
+        if (is_ascii_space(c0)) {
+            ++p;
+            continue;
+        }
+
+        /* UTF-8 NBSP = C2 A0 */
+        if (c0 == 0xC2U && (uint8_t)p[1] == 0xA0U) {
+            p += 2;
+            continue;
+        }
+
+        break;
+    }
+
+    return p;
+}
+
+static esp_err_t normalize_server_url(const char *input,
+                                      char *output,
+                                      size_t output_size)
+{
+    if (input == NULL || output == NULL || output_size < 2U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *p = skip_leading_url_space(input);
+
+    if (strncmp(p, "http://", 7) != 0 && strncmp(p, "https://", 8) != 0) {
+        ESP_LOGE(TAG,
+                 "Invalid TTS URL: must start with http:// or https:// after trimming whitespace");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t n = 0;
+    while (*p != '\0') {
+        const uint8_t c0 = (uint8_t)p[0];
+
+        if (is_ascii_space(c0)) {
+            break;
+        }
+
+        /* URL 本身不应包含 NBSP；把它视作结尾空白。 */
+        if (c0 == 0xC2U && (uint8_t)p[1] == 0xA0U) {
+            break;
+        }
+
+        if (n + 1U >= output_size) {
+            ESP_LOGE(TAG, "TTS URL is too long (max %u chars)",
+                     (unsigned)(output_size - 1U));
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        output[n++] = *p++;
+    }
+
+    output[n] = '\0';
+
+    if (n == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return ESP_OK;
+}
+
 static int append_json_escaped(char *dst,
                                size_t dst_size,
                                size_t *offset,
@@ -118,12 +208,12 @@ static int append_json_escaped(char *dst,
         }
 
         if (escape != NULL) {
-            size_t n = strlen(escape);
-            if (*offset + n >= dst_size) {
+            size_t len = strlen(escape);
+            if (*offset + len >= dst_size) {
                 return -1;
             }
-            memcpy(dst + *offset, escape, n);
-            *offset += n;
+            memcpy(dst + *offset, escape, len);
+            *offset += len;
         } else {
             if (*offset + 1U >= dst_size) {
                 return -1;
@@ -226,19 +316,31 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
         return ESP_ERR_INVALID_ARG;
     }
 
+    char normalized_url[TTS_URL_BUFFER_SIZE];
+    esp_err_t err = normalize_server_url(server_url,
+                                         normalized_url,
+                                         sizeof(normalized_url));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS server URL config is invalid");
+        return err;
+    }
+
     char body[JSON_BODY_SIZE];
     size_t body_len = 0;
-    esp_err_t err = build_request_json(text,
-                                       body,
-                                       sizeof(body),
-                                       &body_len);
+    err = build_request_json(text,
+                             body,
+                             sizeof(body),
+                             &body_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "TTS request JSON too large");
         return err;
     }
 
+    ESP_LOGI(TAG, "POST normalized URL: '%s'", normalized_url);
+    ESP_LOGI(TAG, "TTS text: %s", text);
+
     esp_http_client_config_t config = {
-        .url = server_url,
+        .url = normalized_url,
         .timeout_ms = HTTP_TIMEOUT_MS,
         .buffer_size = HTTP_RX_BUFFER_SIZE,
         .buffer_size_tx = 1024,
@@ -247,7 +349,14 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
-        return ESP_ERR_NO_MEM;
+        /*
+         * esp_http_client_init() 可能因为 URL 解析失败等多种原因返回 NULL，
+         * 不能简单解释成“内存不足”。底层 HTTP_CLIENT 日志会给出更具体原因。
+         */
+        ESP_LOGE(TAG,
+                 "esp_http_client_init failed for URL '%s'",
+                 normalized_url);
+        return ESP_ERR_INVALID_ARG;
     }
 
     bool speaker_clock_changed = false;
@@ -258,9 +367,6 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
     size_t http_bytes_received = 0;
     int64_t request_started_us = esp_timer_get_time();
     int64_t first_pcm_us = 0;
-
-    ESP_LOGI(TAG, "POST %s", server_url);
-    ESP_LOGI(TAG, "TTS text: %s", text);
 
     err = esp_http_client_set_method(client, HTTP_METHOD_POST);
     if (err != ESP_OK) {
