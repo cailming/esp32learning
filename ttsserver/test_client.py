@@ -1,7 +1,7 @@
 """Small desktop client used to verify the ChatTTS streaming API.
 
 It consumes the same raw PCM stream that the ESP32 will consume, but writes it
-into a WAV container so macOS can play it with `afplay`.
+into a WAV container for easy playback on desktop systems.
 
 The client also measures request/header latency, first-audio latency and total
 streaming time so server inference cost can be separated from network/client
@@ -11,10 +11,22 @@ cost.
 from __future__ import annotations
 
 import argparse
+import platform
 import time
 import wave
 
 import requests
+
+
+def playback_hint(path: str) -> str:
+    system = platform.system().lower()
+    if system == "darwin":
+        return f"afplay {path}"
+    if system == "linux":
+        return f"aplay {path}   # or use your desktop audio player"
+    if system == "windows":
+        return f"start {path}"
+    return f"open/play {path} with a WAV player"
 
 
 def main() -> None:
@@ -147,7 +159,7 @@ def main() -> None:
     print(f"PCM bytes         : {total}")
     print("=================================")
     print(f"saved: {args.output}")
-    print(f"macOS playback: afplay {args.output}")
+    print(f"playback: {playback_hint(args.output)}")
 
 
 if __name__ == "__main__":
