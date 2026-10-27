@@ -9,26 +9,9 @@
 
 static const char *TAG = "shutter_wav";
 
-/*
- * 来自：EMBED_FILES "shutter.wav"
- *
- * ESP-IDF 会生成：
- *   _binary_shutter_wav_start
- *   _binary_shutter_wav_end
- */
 extern const uint8_t shutter_wav_start[] asm("_binary_shutter_wav_start");
 extern const uint8_t shutter_wav_end[]   asm("_binary_shutter_wav_end");
 
-/*
- * 当前真实 shutter.wav 的原始格式：44100 Hz / mono / 16-bit PCM。
- *
- * MIC 的 I2S0 仍固定使用 16kHz 给 ESP-SR；Speaker 使用独立的 I2S1。
- * 播放 WAV 前，我们把 I2S1 从平时的 16kHz 临时切到 44.1kHz，
- * 原样播放真实 PCM，结束后再恢复 16kHz。
- *
- * 这样完全避免 44.1kHz -> 16kHz 的实时降采样混叠，快门里的高频瞬态
- * 不会再被扭曲成爆裂/“机关枪”听感。
- */
 #define SHUTTER_SAMPLE_RATE        44100U
 #define SPEAKER_IDLE_SAMPLE_RATE   16000U
 #define OUTPUT_FRAMES_PER_BLOCK   128U
@@ -70,10 +53,6 @@ static bool fourcc_is(const uint8_t *p,
            && p[3] == (uint8_t)d;
 }
 
-/*
- * RIFF/WAV 的 fmt/data chunk 不保证紧挨着，因此逐个扫描 chunk。
- * 当前只接受本工程实际使用的标准 PCM：mono / 16-bit / 44.1kHz。
- */
 static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
 {
     if (data == NULL || info == NULL || size < 12) {
@@ -116,7 +95,6 @@ static esp_err_t parse_wav(const uint8_t *data, size_t size, wav_info_t *info)
             have_data = true;
         }
 
-        /* RIFF chunk 按 2-byte 对齐。 */
         offset = payload + chunk_size + (chunk_size & 1U);
     }
 
@@ -174,15 +152,14 @@ static int16_t apply_gain(int32_t sample)
     return (int16_t)sample;
 }
 
-/*
- * 标准 I2S 的时钟只能在 channel 停止状态下重新配置。
- * 因此流程严格是：disable -> reconfig clock -> enable。
- */
 static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                                          uint32_t sample_rate)
 {
+    /*
+     * ChatTTS 播放结束后会把 I2S1 保持 disabled，因此这里允许“已经 disabled”。
+     */
     esp_err_t err = i2s_channel_disable(tx_chan);
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG,
                  "i2s_channel_disable before %u Hz failed: %s",
                  (unsigned)sample_rate,
@@ -198,8 +175,6 @@ static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                  "reconfig I2S clock to %u Hz failed: %s",
                  (unsigned)sample_rate,
                  esp_err_to_name(err));
-        /* 尽量把 channel 恢复 enable，避免后续完全无声。 */
-        i2s_channel_enable(tx_chan);
         return err;
     }
 
@@ -237,9 +212,6 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
              (unsigned)wav.sample_rate,
              (unsigned)source_samples);
 
-    /*
-     * 关键修正：让 I2S1 跟随 WAV 的原始 44.1kHz，完全取消软件重采样。
-     */
     err = speaker_set_sample_rate(tx_chan, wav.sample_rate);
     if (err != ESP_OK) {
         return err;
@@ -257,7 +229,6 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
             int16_t sample = apply_gain(
                 pcm16_at(wav.pcm, source_index + i));
 
-            /* WAV 是 mono；I2S 使用 stereo framing，左右复制同一个样本。 */
             s_output[i * 2U] = sample;
             s_output[i * 2U + 1U] = sample;
         }
@@ -287,10 +258,6 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
         source_index += frames;
     }
 
-    /*
-     * 播放完成后把 I2S1 恢复到工程原来的 16kHz 空闲配置。
-     * 即使播放中途失败，也尽量执行恢复。
-     */
     esp_err_t restore_err = speaker_set_sample_rate(tx_chan,
                                                     SPEAKER_IDLE_SAMPLE_RATE);
     if (err == ESP_OK && restore_err != ESP_OK) {
