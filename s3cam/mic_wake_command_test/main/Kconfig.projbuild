@@ -1,0 +1,35 @@
+menu "ChatTTS / uplink network"
+
+config TTS_SERVER_URL
+    string "ChatTTS streaming URL"
+    default ""
+    help
+        ChatTTS streaming endpoint used by the ESP32 status-query command.
+        Example: http://192.168.1.20:8000/tts/stream
+
+        Leave empty to disable TTS playback while keeping the rest of the
+        voice/camera application working normally.
+
+config TTS_WIFI_STA_ENABLE
+    bool "Enable Wi-Fi STA uplink in addition to S3CAM-Photo SoftAP"
+    default n
+    help
+        Keep the existing S3CAM-Photo SoftAP/web page, and also connect the
+        ESP32 to an existing LAN so it can reach the ChatTTS server.
+
+        This changes Wi-Fi mode from AP to AP+STA. The SoftAP remains available
+        at http://192.168.4.1/.
+
+if TTS_WIFI_STA_ENABLE
+
+config TTS_WIFI_STA_SSID
+    string "Uplink Wi-Fi SSID"
+    default ""
+
+config TTS_WIFI_STA_PASSWORD
+    string "Uplink Wi-Fi password"
+    default ""
+
+endif
+
+endmenu
