@@ -41,6 +41,7 @@ idf_component_register(
         "shutter_wav_player.c"
         "photo_http_server.c"
         "tts_client.c"
+        "tts_service.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_driver_i2s
