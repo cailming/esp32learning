@@ -45,20 +45,47 @@ static void wifi_uplink_event_handler(void *arg,
     (void)arg;
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "STA uplink starting -> connect to %s", CONFIG_TTS_WIFI_STA_SSID);
+        ESP_LOGI(TAG,
+                 "STA uplink starting -> connect to %s",
+                 CONFIG_TTS_WIFI_STA_SSID);
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG,
+                     "esp_wifi_connect failed: %s",
+                     esp_err_to_name(err));
         }
         return;
     }
 
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        const wifi_event_sta_connected_t *event =
+            (const wifi_event_sta_connected_t *)event_data;
+        ESP_LOGI(TAG,
+                 "STA uplink associated: channel=%u authmode=%u",
+                 (unsigned)event->channel,
+                 (unsigned)event->authmode);
+        return;
+    }
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event =
+            (const wifi_event_sta_disconnected_t *)event_data;
+
         s_sta_has_ip = false;
-        ESP_LOGW(TAG, "STA uplink disconnected, reconnecting...");
+
+        /*
+         * reason 是定位 STA 掉线最关键的信息。之前这里只打印“disconnected”，
+         * 无法区分密码/认证、信号、AP 主动踢下线、握手超时等情况。
+         */
+        ESP_LOGW(TAG,
+                 "STA uplink disconnected: reason=%u, reconnecting...",
+                 event != NULL ? (unsigned)event->reason : 0U);
+
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "STA reconnect failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG,
+                     "STA reconnect failed: %s",
+                     esp_err_to_name(err));
         }
         return;
     }
@@ -67,8 +94,9 @@ static void wifi_uplink_event_handler(void *arg,
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         s_sta_has_ip = true;
         ESP_LOGI(TAG,
-                 "STA uplink GOT IP: " IPSTR,
-                 IP2STR(&event->ip_info.ip));
+                 "STA uplink GOT IP: " IPSTR " gateway=" IPSTR,
+                 IP2STR(&event->ip_info.ip),
+                 IP2STR(&event->ip_info.gw));
     }
 }
 #endif
@@ -127,7 +155,9 @@ static esp_err_t start_wifi(void)
 
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG,
+                 "esp_event_loop_create_default failed: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
@@ -155,8 +185,10 @@ static esp_err_t start_wifi(void)
     err = esp_wifi_init(&init_cfg);
     if (err != ESP_OK) {
         log_memory("after esp_wifi_init FAILED");
-        ESP_LOGE(TAG, "esp_wifi_init failed: %s (0x%x)",
-                 esp_err_to_name(err), (unsigned)err);
+        ESP_LOGE(TAG,
+                 "esp_wifi_init failed: %s (0x%x)",
+                 esp_err_to_name(err),
+                 (unsigned)err);
         return err;
     }
 
@@ -227,6 +259,21 @@ static esp_err_t start_wifi(void)
 #endif
 
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start failed");
+
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    /*
+     * TTS 是低延迟交互流。关闭 STA 省电可减少睡眠/唤醒造成的额外延迟，
+     * 也避免某些 AP+STA 环境下长连接/突发流量期间的稳定性问题。
+     */
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "esp_wifi_set_ps(WIFI_PS_NONE) failed: %s",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "STA Wi-Fi power save disabled for TTS uplink");
+    }
+#endif
 
     ESP_LOGI(TAG, "Wi-Fi SoftAP started");
     ESP_LOGI(TAG, "SSID     : %s", AP_SSID);
