@@ -15,7 +15,6 @@
  *      -> 接收 24kHz / PCM16 / mono
  *      -> I2S1 临时切换到 24kHz
  *      -> mono 复制为 stereo -> MAX98357A
- *      -> 播放完成恢复 I2S1 16kHz
  *
  * 已验证硬件接线：
  *   Camera：板载 OV3660，GPIO 见 camera_capture.c
@@ -83,13 +82,7 @@ static i2s_chan_handle_t s_mic_rx = NULL;
 
 /* ========================================================================
  * 2. MAX98357A / I2S1 TX 配置
- * ========================================================================
- *
- * I2S1 默认保持 16kHz：
- *   shutter_wav_player.c 播快门时临时切 44.1kHz；
- *   tts_client.c 播 TTS 时临时切 24kHz；
- * 两者播放完成都会恢复 16kHz。
- */
+ * ======================================================================== */
 #define SPK_I2S_PORT       I2S_NUM_1
 #define SPK_BCLK_GPIO      GPIO_NUM_14
 #define SPK_WS_GPIO        GPIO_NUM_3
@@ -101,7 +94,10 @@ static SemaphoreHandle_t s_speaker_mutex = NULL;
 
 /*
  * Speaker 播放期间置 true。
- * audio_feed_task 仍持续读取 MIC，但向 AFE 喂 0，避免快门声/TTS 回灌语音识别。
+ * audio_feed_task 仍持续从 I2S0 读取 MIC，避免 RX DMA 堵住；
+ * 但暂停向 AFE feed()，因为 speech_detect_task 此时正在同步执行 TTS，
+ * 不会调用 fetch()。如果仍继续 feed，会把 AFE ringbuffer 灌满，产生大量
+ * warning，并明显干扰 Wi-Fi/HTTP/I2S 实时播放。
  */
 static volatile bool s_speaker_playing = false;
 
@@ -548,29 +544,34 @@ static void audio_feed_task(void *arg)
             break;
         }
 
+        /*
+         * Speaker 正在播放时 speech_detect_task 会同步阻塞在 TTS/快门播放中，
+         * 此时没有消费者调用 AFE fetch()。继续 feed 即使喂 0 也会把 ringbuffer
+         * 灌满并持续刷 warning。因此只保持 MIC I2S 读取，不再向 AFE 投递数据。
+         */
+        if (s_speaker_playing) {
+            if ((++frame_count % 100) == 0) {
+                ESP_LOGI(TAG, "MIC alive: speaker guard, AFE feed paused");
+            }
+            continue;
+        }
+
         int16_t peak = 0;
 
-        if (s_speaker_playing) {
-            memset(mono_s16, 0, feed_samples * sizeof(int16_t));
-        } else {
-            for (int i = 0; i < feed_samples; ++i) {
-                int16_t sample = mic_sample_to_s16(raw_stereo[i * 2]);
-                mono_s16[i] = sample;
+        for (int i = 0; i < feed_samples; ++i) {
+            int16_t sample = mic_sample_to_s16(raw_stereo[i * 2]);
+            mono_s16[i] = sample;
 
-                int32_t abs_sample = sample >= 0 ? sample : -(int32_t)sample;
-                if (abs_sample > peak) {
-                    peak = (int16_t)abs_sample;
-                }
+            int32_t abs_sample = sample >= 0 ? sample : -(int32_t)sample;
+            if (abs_sample > peak) {
+                peak = (int16_t)abs_sample;
             }
         }
 
         s_afe_handle->feed(afe_data, mono_s16);
 
         if ((++frame_count % 100) == 0) {
-            ESP_LOGI(TAG,
-                     "MIC alive: peak=%d%s",
-                     peak,
-                     s_speaker_playing ? " (speaker guard)" : "");
+            ESP_LOGI(TAG, "MIC alive: peak=%d", peak);
         }
     }
 
@@ -759,24 +760,16 @@ void app_main(void)
                  "WakeNet + MultiNet + Wi-Fi 也可能受内存限制影响。");
     }
 
-    /*
-     * 先初始化核心硬件能力：
-     *   Camera：板载 OV3660
-     *   I2S0：INMP441 RX
-     *   I2S1：MAX98357A TX
-     */
     ESP_ERROR_CHECK(camera_capture_init());
     ESP_ERROR_CHECK(init_mic_i2s());
     ESP_ERROR_CHECK(init_speaker_i2s());
 
-    /* 从 model 分区加载 WakeNet10 / MultiNet6。 */
     s_models = esp_srmodel_init("model");
     if (s_models == NULL) {
         ESP_LOGE(TAG, "esp_srmodel_init(model) failed");
         return;
     }
 
-    /* 单麦克风输入，不提供 playback reference。 */
     afe_config_t *afe_config = afe_config_init("M",
                                                s_models,
                                                AFE_TYPE_SR,
@@ -811,10 +804,6 @@ void app_main(void)
                                                  NULL,
                                                  0);
 
-    /*
-     * speech_detect 现在会同步执行 HTTP/TTS，栈从原 10KB 提高到 14KB。
-     * tts_client 的大 stereo buffer 是 static，不会继续吃 task stack。
-     */
     BaseType_t detect_ok = xTaskCreatePinnedToCore(speech_detect_task,
                                                    "speech_detect",
                                                    14 * 1024,
@@ -829,11 +818,6 @@ void app_main(void)
         return;
     }
 
-    /*
-     * 核心 Camera / ESP-SR 已经就绪后，再启动 Wi-Fi + HTTP。
-     * 默认仍是 S3CAM-Photo SoftAP；如果 menuconfig 开启 TTS STA uplink，
-     * 则使用 AP+STA，保留 192.168.4.1 的同时接入现有局域网访问 RTX3090。
-     */
     ESP_ERROR_CHECK(photo_http_server_start());
 
     ESP_LOGI(TAG, "====================================================");
