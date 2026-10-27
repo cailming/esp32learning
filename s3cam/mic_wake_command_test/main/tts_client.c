@@ -15,20 +15,17 @@
 static const char *TAG = "tts_client";
 
 #define TTS_SAMPLE_RATE             24000U
-#define SPEAKER_IDLE_SAMPLE_RATE    16000U
 #define HTTP_RX_BUFFER_SIZE         2048U
 #define JSON_BODY_SIZE              512U
 #define TTS_URL_BUFFER_SIZE         256U
 #define HTTP_TIMEOUT_MS             10000
 
 /*
- * TTS 结束后不能立刻把 I2S1 从 24kHz 切回 16kHz。
- * i2s_channel_write() 返回时，最后一批样本可能仍在 DMA 中等待真正送完。
- * 如果此时 disable -> reconfig -> enable，DMA 中残留的非零语音数据可能在
- * 新时钟下继续/重复输出，MAX98357A 听起来就会像“嘀嗒/机关枪”。
+ * TTS 结束时先在 24kHz 下补一小段静音，让最后的语音样本完整播完；
+ * 然后直接 disable I2S1，空闲期间不再维持 16kHz 时钟。
  *
- * 因此结束时先在 24kHz 下写入一段全 0 PCM，让 DMA 尾部被静音覆盖，
- * 再额外等待一小段时间确保这些 0 真正移出 I2S，最后才恢复 16kHz。
+ * 之前“恢复到 16kHz 后继续保持 channel enabled”的做法，在部分 MAX98357A /
+ * DMA 状态下会产生重复的咔哒/机关枪尾音。停掉 I2S 比猜测空闲 DMA 内容更可靠。
  */
 #define TTS_TAIL_SILENCE_MS         120U
 #define TTS_DMA_DRAIN_GUARD_MS       80U
@@ -40,15 +37,17 @@ static const char *TAG = "tts_client";
  * 所以这里预留 1025 frame。I2S 使用 stereo framing，因此 *2。
  */
 static int16_t s_stereo_output[(HTTP_RX_BUFFER_SIZE / 2U + 1U) * 2U];
-
-/* 静态区自动清零，专门用于 TTS 尾部把 DMA 内容刷成静音。 */
 static int16_t s_silence_output[SILENCE_FRAMES_PER_BLOCK * 2U];
 
 static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                                          uint32_t sample_rate)
 {
+    /*
+     * TTS 结束后 channel 会保持 disabled；因此下一次播放时 disable() 返回
+     * ESP_ERR_INVALID_STATE 是正常状态，不应当当成错误。
+     */
     esp_err_t err = i2s_channel_disable(tx_chan);
-    if (err != ESP_OK) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG,
                  "i2s_channel_disable before %u Hz failed: %s",
                  (unsigned)sample_rate,
@@ -64,8 +63,6 @@ static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                  "reconfig I2S clock to %u Hz failed: %s",
                  (unsigned)sample_rate,
                  esp_err_to_name(err));
-        /* 尽量恢复 enable，避免后续 Speaker 完全无声。 */
-        i2s_channel_enable(tx_chan);
         return err;
     }
 
@@ -107,10 +104,6 @@ static esp_err_t i2s_write_all(i2s_chan_handle_t tx_chan,
     return ESP_OK;
 }
 
-/*
- * 在仍保持 24kHz 的情况下向 I2S1 写足够长的 stereo silence。
- * 这不是给 TTS 音频“补静音文件”，而是专门用来覆盖 DMA 尾部缓存。
- */
 static esp_err_t speaker_flush_tts_tail(i2s_chan_handle_t tx_chan)
 {
     const size_t total_frames =
@@ -118,7 +111,7 @@ static esp_err_t speaker_flush_tts_tail(i2s_chan_handle_t tx_chan)
     size_t frames_left = total_frames;
 
     ESP_LOGI(TAG,
-             "Flush TTS tail with %u ms silence before clock restore",
+             "Flush TTS tail with %u ms silence before stopping I2S",
              (unsigned)TTS_TAIL_SILENCE_MS);
 
     while (frames_left > 0U) {
@@ -141,10 +134,6 @@ static esp_err_t speaker_flush_tts_tail(i2s_chan_handle_t tx_chan)
         frames_left -= frames;
     }
 
-    /*
-     * i2s_channel_write() 只保证数据交给驱动/DMA，不代表最后一个 sample 已经
-     * 从引脚发完。再等一段 guard，让 DMA 中剩余的静音真正移出。
-     */
     vTaskDelay(pdMS_TO_TICKS(TTS_DMA_DRAIN_GUARD_MS));
 
     ESP_LOGI(TAG,
@@ -155,21 +144,6 @@ static esp_err_t speaker_flush_tts_tail(i2s_chan_handle_t tx_chan)
     return ESP_OK;
 }
 
-/*
- * menuconfig 中粘贴 URL 时，尤其从浏览器/聊天窗口复制，前后偶尔会带：
- *   - 普通空格 / Tab / CR / LF
- *   - UTF-8 NBSP（C2 A0，不换行空格）
- *
- * esp_http_client 的 URL parser 对这些前缀非常严格，会直接报：
- *   Error parse url
- *   Failed to set URL
- *
- * 因此这里先做一层小型规范化：
- *   1. 跳过开头的 ASCII 空白和 UTF-8 NBSP；
- *   2. 从 http:// 或 https:// 开始复制；
- *   3. 遇到结尾空白即停止；
- *   4. 再检查 scheme，避免把坏配置误报成 ESP_ERR_NO_MEM。
- */
 static bool is_ascii_space(uint8_t c)
 {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
@@ -185,7 +159,6 @@ static const char *skip_leading_url_space(const char *p)
             continue;
         }
 
-        /* UTF-8 NBSP = C2 A0 */
         if (c0 == 0xC2U && (uint8_t)p[1] == 0xA0U) {
             p += 2;
             continue;
@@ -221,7 +194,6 @@ static esp_err_t normalize_server_url(const char *input,
             break;
         }
 
-        /* URL 本身不应包含 NBSP；把它视作结尾空白。 */
         if (c0 == 0xC2U && (uint8_t)p[1] == 0xA0U) {
             break;
         }
@@ -414,10 +386,6 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
-        /*
-         * esp_http_client_init() 可能因为 URL 解析失败等多种原因返回 NULL，
-         * 不能简单解释成“内存不足”。底层 HTTP_CLIENT 日志会给出更具体原因。
-         */
         ESP_LOGE(TAG,
                  "esp_http_client_init failed for URL '%s'",
                  normalized_url);
@@ -524,10 +492,6 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
     }
 
     if (err == ESP_OK && pending_valid) {
-        /*
-         * PCM16 合法流最终必须是偶数字节。如果结尾还残留 1 byte，说明响应损坏；
-         * 不把半个 sample 写进喇叭。
-         */
         ESP_LOGE(TAG, "PCM stream ended with one dangling byte");
         err = ESP_ERR_INVALID_SIZE;
     }
@@ -537,19 +501,25 @@ cleanup:
     esp_http_client_cleanup(client);
 
     if (speaker_clock_changed) {
-        /*
-         * 关键：不要在最后一包语音刚写入 DMA 后立刻切时钟。
-         * 先用全 0 静音把 DMA 尾部覆盖并等待排空，再恢复 16kHz。
-         */
         esp_err_t tail_err = speaker_flush_tts_tail(tx_chan);
         if (err == ESP_OK && tail_err != ESP_OK) {
             err = tail_err;
         }
 
-        esp_err_t restore_err = speaker_set_sample_rate(tx_chan,
-                                                        SPEAKER_IDLE_SAMPLE_RATE);
-        if (err == ESP_OK && restore_err != ESP_OK) {
-            err = restore_err;
+        /*
+         * 不再恢复 16kHz 后保持 I2S1 空转。TTS 完成后直接停掉 TX channel。
+         * 下一次 TTS 或 shutter 播放时 speaker_set_sample_rate() 会重新配置并 enable。
+         */
+        esp_err_t stop_err = i2s_channel_disable(tx_chan);
+        if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG,
+                     "stop Speaker I2S after TTS failed: %s",
+                     esp_err_to_name(stop_err));
+            if (err == ESP_OK) {
+                err = stop_err;
+            }
+        } else {
+            ESP_LOGI(TAG, "Speaker I2S disabled after TTS");
         }
     }
 
