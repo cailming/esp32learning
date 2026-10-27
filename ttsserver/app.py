@@ -3,7 +3,7 @@
 Protocol:
     POST /tts/stream
     Content-Type: application/json
-    {"text": "设备正常，当前未录像。"}
+    {"text": "设备正常，当前未录像。", "skip_refine_text": true}
 
 Response body:
     Raw PCM stream, signed 16-bit little-endian, mono, 24000 Hz.
@@ -49,10 +49,20 @@ PCM_BYTES_PER_SECOND = (
 MODEL_SOURCE = os.getenv("CHATTTS_SOURCE", "huggingface")
 SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "2222"))
 COMPILE_MODEL = os.getenv("CHATTTS_COMPILE", "0") == "1"
+
+# These defaults are tuned for the ESP32 low-latency device speech use case.
+# RTX3090 measurements: batch=24, pass_first=0 -> ~0.17s warm first PCM,
+# RTF ~0.33. Environment variables can still override them for experiments.
 STREAM_BATCH = int(os.getenv("CHATTTS_STREAM_BATCH", "24"))
 STREAM_SPEED = int(os.getenv("CHATTTS_STREAM_SPEED", "12000"))
-PASS_FIRST_N_BATCHES = int(os.getenv("CHATTTS_PASS_FIRST_N_BATCHES", "2"))
+PASS_FIRST_N_BATCHES = int(os.getenv("CHATTTS_PASS_FIRST_N_BATCHES", "0"))
 LOG_CHUNKS = os.getenv("CHATTTS_LOG_CHUNKS", "0") == "1"
+
+# The first real CUDA/CPU inference is slower than steady state. Warm up once
+# during application startup so the first ESP32 request gets steady-state
+# latency instead of paying lazy CUDA/PyTorch initialization cost.
+WARMUP_ENABLED = os.getenv("CHATTTS_WARMUP", "1") == "1"
+WARMUP_TEXT = os.getenv("CHATTTS_WARMUP_TEXT", "设备启动")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -62,6 +72,8 @@ logger = logging.getLogger("ttsserver")
 
 _chat: ChatTTS.Chat | None = None
 _speaker_embedding: str | None = None
+_warmup_ok = False
+_warmup_elapsed = 0.0
 
 # ChatTTS/PyTorch inference is serialized deliberately. The ESP32 use case is
 # interactive device speech, not a high-concurrency public API. Serializing
@@ -138,7 +150,6 @@ def _pcm_stream(request_id: str, req: TTSRequest) -> Generator[bytes, None, None
 
     request_started = time.perf_counter()
     inference_started: float | None = None
-    generator_created: float | None = None
     first_chunk_at: float | None = None
     last_chunk_at: float | None = None
     total_bytes = 0
@@ -287,9 +298,45 @@ def _pcm_stream(request_id: str, req: TTSRequest) -> Generator[bytes, None, None
         )
 
 
+def _run_startup_warmup() -> tuple[bool, float]:
+    """Run one tiny inference and discard PCM to warm CUDA/PyTorch caches."""
+
+    if not WARMUP_ENABLED:
+        logger.info("Startup warmup disabled by CHATTTS_WARMUP=0")
+        return False, 0.0
+
+    started = time.perf_counter()
+    logger.info("Startup warmup begin: text=%r", WARMUP_TEXT)
+
+    req = TTSRequest(
+        text=WARMUP_TEXT,
+        lang="zh",
+        skip_refine_text=True,
+    )
+
+    total_bytes = 0
+    try:
+        for pcm in _pcm_stream("warmup", req):
+            total_bytes += len(pcm)
+    except Exception:
+        elapsed = time.perf_counter() - started
+        logger.exception("Startup warmup failed after %.3fs", elapsed)
+        return False, elapsed
+
+    elapsed = time.perf_counter() - started
+    audio_seconds = total_bytes / PCM_BYTES_PER_SECOND
+    logger.info(
+        "Startup warmup complete: elapsed=%.3fs discarded_audio=%.3fs bytes=%d",
+        elapsed,
+        audio_seconds,
+        total_bytes,
+    )
+    return True, elapsed
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _chat, _speaker_embedding
+    global _chat, _speaker_embedding, _warmup_ok, _warmup_elapsed
 
     startup_started = time.perf_counter()
     logger.info(
@@ -318,19 +365,31 @@ async def lifespan(_: FastAPI):
     _chat = chat
     _speaker_embedding = speaker_embedding
 
-    startup_elapsed = time.perf_counter() - startup_started
     logger.info(
-        "ChatTTS ready: device=%s speaker_seed=%d native_pcm=%dHz/%dbit/mono",
+        "ChatTTS model ready: device=%s speaker_seed=%d native_pcm=%dHz/%dbit/mono",
         getattr(chat, "device", "unknown"),
         SPEAKER_SEED,
         CHAT_TTS_SAMPLE_RATE,
         PCM_BITS_PER_SAMPLE,
     )
+
+    _warmup_ok, _warmup_elapsed = _run_startup_warmup()
+
+    startup_elapsed = time.perf_counter() - startup_started
     logger.info(
-        "STARTUP PERF: model_load=%.3fs speaker_init=%.3fs total=%.3fs",
+        "STARTUP PERF: model_load=%.3fs speaker_init=%.3fs warmup=%.3fs "
+        "warmup_ok=%s total=%.3fs",
         model_load_elapsed,
         speaker_elapsed,
+        _warmup_elapsed,
+        _warmup_ok,
         startup_elapsed,
+    )
+    logger.info(
+        "ChatTTS ready for ESP32: batch=%d speed=%d pass_first=%d",
+        STREAM_BATCH,
+        STREAM_SPEED,
+        PASS_FIRST_N_BATCHES,
     )
 
     try:
@@ -344,11 +403,13 @@ async def lifespan(_: FastAPI):
                 logger.exception("ChatTTS unload failed")
         _chat = None
         _speaker_embedding = None
+        _warmup_ok = False
+        _warmup_elapsed = 0.0
 
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -363,6 +424,11 @@ def health() -> dict:
         "device": str(getattr(_chat, "device", "not-loaded")),
         "busy": _inference_lock.locked(),
         "speaker_seed": SPEAKER_SEED,
+        "warmup": {
+            "enabled": WARMUP_ENABLED,
+            "ok": _warmup_ok,
+            "elapsed_seconds": round(_warmup_elapsed, 3),
+        },
         "stream": {
             "batch": STREAM_BATCH,
             "speed": STREAM_SPEED,
