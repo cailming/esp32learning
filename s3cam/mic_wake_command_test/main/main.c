@@ -1,30 +1,23 @@
 /*
- * ESP32-S3-CAM：真实 Camera 拍照 + INMP441 语音唤醒 + 中文命令 + WAV 快门音
+ * ESP32-S3-CAM：Camera + INMP441 + ESP-SR + MAX98357A + ChatTTS
  *
- * 当前完整“拍照”链路：
+ * 主要链路：
+ *   “你好小智” -> WakeNet10 -> MultiNet6
  *
- *   “你好小智”
- *       ↓
- *   WakeNet10 唤醒
- *       ↓
  *   “拍照”
- *       ↓
- *   MultiNet6 命令识别
- *       ↓
- *   camera_capture_one()
- *       ↓
- *   OV3660 真正抓取 QVGA JPEG
- *       ↓
- *   JPEG 校验并复制为“最新照片”
- *       ↓
- *   拍照成功后播放 shutter.wav
- *       ↓
- *   Wi-Fi / HTTP 页面自动显示最新照片
- *       ↓
- *   重新等待“你好小智”
+ *      -> OV3660 抓拍 JPEG
+ *      -> 保存最新照片
+ *      -> 播放真实 shutter.wav
+ *
+ *   “状态查询”
+ *      -> 生成简短状态文本
+ *      -> POST ChatTTS /tts/stream
+ *      -> 接收 24kHz / PCM16 / mono
+ *      -> I2S1 临时切换到 24kHz
+ *      -> mono 复制为 stereo -> MAX98357A
+ *      -> 播放完成恢复 I2S1 16kHz
  *
  * 已验证硬件接线：
- *
  *   Camera：板载 OV3660，GPIO 见 camera_capture.c
  *   INMP441 SCK/BCLK -> GPIO42
  *   INMP441 WS/LRCLK -> GPIO41
@@ -52,6 +45,7 @@
 #include "esp_log.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 /* ESP-SR：AFE / WakeNet / MultiNet */
@@ -67,6 +61,7 @@
 #include "camera_capture.h"
 #include "photo_http_server.h"
 #include "shutter_wav_player.h"
+#include "tts_client.h"
 
 #if !CONFIG_IDF_TARGET_ESP32S3
 #error "mic_wake_command_test 只用于 ESP32-S3，请先执行 idf.py set-target esp32s3"
@@ -90,9 +85,10 @@ static i2s_chan_handle_t s_mic_rx = NULL;
  * 2. MAX98357A / I2S1 TX 配置
  * ========================================================================
  *
- * I2S1 默认保持 16kHz。播放真实快门 WAV 时，shutter_wav_player.c 会临时
- * 把 I2S1 时钟切换到 WAV 原生 44.1kHz，播放完成后再恢复为 16kHz。
- * MIC 使用独立 I2S0，因此不受影响。
+ * I2S1 默认保持 16kHz：
+ *   shutter_wav_player.c 播快门时临时切 44.1kHz；
+ *   tts_client.c 播 TTS 时临时切 24kHz；
+ * 两者播放完成都会恢复 16kHz。
  */
 #define SPK_I2S_PORT       I2S_NUM_1
 #define SPK_BCLK_GPIO      GPIO_NUM_14
@@ -101,10 +97,11 @@ static i2s_chan_handle_t s_mic_rx = NULL;
 #define SPK_SAMPLE_RATE    16000
 
 static i2s_chan_handle_t s_speaker_tx = NULL;
+static SemaphoreHandle_t s_speaker_mutex = NULL;
 
 /*
  * Speaker 播放期间置 true。
- * audio_feed_task 仍持续读取 MIC，但向 AFE 喂 0，避免快门声回灌语音识别。
+ * audio_feed_task 仍持续读取 MIC，但向 AFE 喂 0，避免快门声/TTS 回灌语音识别。
  */
 static volatile bool s_speaker_playing = false;
 
@@ -176,7 +173,7 @@ static const char *command_name_from_id(int command_id)
 }
 
 /* ========================================================================
- * 6. MAX98357A / Speaker 初始化
+ * 6. MAX98357A / Speaker 初始化与统一播放保护
  * ======================================================================== */
 static esp_err_t init_speaker_i2s(void)
 {
@@ -214,6 +211,12 @@ static esp_err_t init_speaker_i2s(void)
                         TAG,
                         "speaker i2s_channel_enable failed");
 
+    s_speaker_mutex = xSemaphoreCreateMutex();
+    if (s_speaker_mutex == NULL) {
+        ESP_LOGE(TAG, "speaker mutex create failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG,
              "Speaker I2S ready: 16kHz idle, BCLK=%d, LRC=%d, DOUT=%d",
              SPK_BCLK_GPIO,
@@ -221,6 +224,21 @@ static esp_err_t init_speaker_i2s(void)
              SPK_DOUT_GPIO);
 
     return ESP_OK;
+}
+
+static bool speaker_lock(void)
+{
+    if (s_speaker_mutex == NULL) {
+        return false;
+    }
+    return xSemaphoreTake(s_speaker_mutex, portMAX_DELAY) == pdTRUE;
+}
+
+static void speaker_unlock(void)
+{
+    if (s_speaker_mutex != NULL) {
+        xSemaphoreGive(s_speaker_mutex);
+    }
 }
 
 /* 真正的 Camera 拍照成功以后才调用此函数播放确认音。 */
@@ -231,6 +249,10 @@ static esp_err_t play_camera_shutter_sound(void)
         return ESP_OK;
     }
 
+    if (!speaker_lock()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "SHUTTER WAV: photo success -> play once");
     s_speaker_playing = true;
 
@@ -239,9 +261,46 @@ static esp_err_t play_camera_shutter_sound(void)
     /* 留 120ms 声学保护时间，让 Speaker 尾音衰减。 */
     vTaskDelay(pdMS_TO_TICKS(120));
     s_speaker_playing = false;
+    speaker_unlock();
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SHUTTER WAV failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t play_tts_text(const char *text)
+{
+    if (!s_sound_enabled) {
+        ESP_LOGI(TAG, "TTS: 当前声音已关闭，不播放状态播报");
+        return ESP_OK;
+    }
+
+    if (strlen(CONFIG_TTS_SERVER_URL) == 0U) {
+        ESP_LOGW(TAG,
+                 "TTS: CONFIG_TTS_SERVER_URL 为空；请在 idf.py menuconfig -> "
+                 "ChatTTS / uplink network 中配置服务器地址");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!speaker_lock()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "TTS: begin -> %s", CONFIG_TTS_SERVER_URL);
+    s_speaker_playing = true;
+
+    esp_err_t err = tts_client_play(s_speaker_tx,
+                                    CONFIG_TTS_SERVER_URL,
+                                    text);
+
+    /* 同样保留一点尾音保护时间，避免恢复识别时立刻吃到扬声器残响。 */
+    vTaskDelay(pdMS_TO_TICKS(120));
+    s_speaker_playing = false;
+    speaker_unlock();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS playback failed: %s", esp_err_to_name(err));
     }
     return err;
 }
@@ -275,10 +334,6 @@ static bool execute_voice_command(int command_id)
             return true;
         }
 
-        /*
-         * camera_capture_one() 成功后，JPEG 已经复制并保留为“最新照片”。
-         * sequence 只在真正拍照成功后递增，因此它就是成功拍照计数。
-         */
         s_photo_success_count = photo.sequence;
 
         ESP_LOGI(TAG,
@@ -316,7 +371,7 @@ static bool execute_voice_command(int command_id)
 
     case CMD_SOUND_OFF:
         s_sound_enabled = false;
-        ESP_LOGI(TAG, "ACTION: 声音状态 -> OFF（仍会真实拍照，只是不播放快门音）");
+        ESP_LOGI(TAG, "ACTION: 声音状态 -> OFF（拍照仍执行，只是不播放 Speaker）");
         break;
 
     case CMD_QUERY_STATUS: {
@@ -344,7 +399,29 @@ static bool execute_voice_command(int command_id)
                      (unsigned)latest_height,
                      (unsigned)latest_size);
         }
-        break;
+
+        char status_text[128];
+        int n = snprintf(status_text,
+                         sizeof(status_text),
+                         "设备正常，当前%s，声音%s。",
+                         s_video_recording ? "正在录像" : "未录像",
+                         s_sound_enabled ? "已开启" : "已关闭");
+
+        if (n > 0 && n < (int)sizeof(status_text)) {
+            esp_err_t tts_err = play_tts_text(status_text);
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 状态已打印，但 TTS 播报失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        } else {
+            ESP_LOGE(TAG, "ACTION: status text build failed");
+        }
+
+        /* TTS 播放后清理 MultiNet，避免 Speaker 尾音影响下一条命令。 */
+        ESP_LOGI(TAG, "ACTION: 状态查询结束，重新等待唤醒词");
+        ESP_LOGI(TAG, "====================================================");
+        return true;
     }
 
     case CMD_EXIT_VOICE:
@@ -583,7 +660,7 @@ static void speech_detect_task(void *arg)
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
     ESP_LOGI(TAG, "唤醒后可以说：拍照 / 开始录像 / 状态查询 ...");
-    ESP_LOGI(TAG, "拍照命令：Camera 真抓拍 JPEG -> 保存最新照片 -> 播放快门音");
+    ESP_LOGI(TAG, "状态查询：通过 ChatTTS 服务器实时流式播报");
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
@@ -662,12 +739,15 @@ static void speech_detect_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "====================================================");
-    ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA PHOTO + WAV + WEB VIEW");
+    ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ChatTTS + WEB");
     ESP_LOGI(TAG, "Camera  : OV3660 / QVGA JPEG / real capture");
     ESP_LOGI(TAG, "INMP441 : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
     ESP_LOGI(TAG, "Speaker : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
     ESP_LOGI(TAG, "Web     : S3CAM-Photo -> http://192.168.4.1/");
+    ESP_LOGI(TAG,
+             "TTS     : %s",
+             strlen(CONFIG_TTS_SERVER_URL) > 0U ? CONFIG_TTS_SERVER_URL : "(not configured)");
     ESP_LOGI(TAG, "====================================================");
 
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -731,9 +811,13 @@ void app_main(void)
                                                  NULL,
                                                  0);
 
+    /*
+     * speech_detect 现在会同步执行 HTTP/TTS，栈从原 10KB 提高到 14KB。
+     * tts_client 的大 stereo buffer 是 static，不会继续吃 task stack。
+     */
     BaseType_t detect_ok = xTaskCreatePinnedToCore(speech_detect_task,
                                                    "speech_detect",
-                                                   10 * 1024,
+                                                   14 * 1024,
                                                    s_afe_data,
                                                    5,
                                                    NULL,
@@ -747,14 +831,18 @@ void app_main(void)
 
     /*
      * 核心 Camera / ESP-SR 已经就绪后，再启动 Wi-Fi + HTTP。
-     * 网页只查看“最新 JPEG”，不启用 MJPEG 实时视频，减少资源占用。
+     * 默认仍是 S3CAM-Photo SoftAP；如果 menuconfig 开启 TTS STA uplink，
+     * 则使用 AP+STA，保留 192.168.4.1 的同时接入现有局域网访问 RTX3090。
      */
     ESP_ERROR_CHECK(photo_http_server_start());
 
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "SYSTEM READY");
-    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照");
+    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照 / 状态查询");
     ESP_LOGI(TAG, "Wi-Fi : S3CAM-Photo / 12345678");
     ESP_LOGI(TAG, "Web   : http://192.168.4.1/");
+    ESP_LOGI(TAG,
+             "TTS   : %s",
+             strlen(CONFIG_TTS_SERVER_URL) > 0U ? CONFIG_TTS_SERVER_URL : "disabled until configured");
     ESP_LOGI(TAG, "====================================================");
 }
