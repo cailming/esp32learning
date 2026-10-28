@@ -15,6 +15,7 @@ PCM block to I2S without buffering the complete sentence in RAM.
 from __future__ import annotations
 
 import logging
+import lzma
 import os
 import sys
 import threading
@@ -31,6 +32,7 @@ if sys.platform == "darwin":
 
 import ChatTTS
 import numpy as np
+import pybase16384 as b14
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -46,9 +48,24 @@ PCM_BYTES_PER_SECOND = (
     CHAT_TTS_SAMPLE_RATE * PCM_CHANNELS * PCM_BYTES_PER_SAMPLE
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_SOURCE = os.getenv("CHATTTS_SOURCE", "huggingface")
-SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "2222"))
 COMPILE_MODEL = os.getenv("CHATTTS_COMPILE", "0") == "1"
+
+# 固定音色配置：
+# - 默认读取 ttsserver/speakers/seed_492.pt。
+# - 后续有新音色时，只要把 .pt 放进 speakers/，然后通过
+#   CHATTTS_SPEAKER_FILE=seed_xxx.pt 即可切换，不需要改代码。
+# - 也支持绝对路径，例如：
+#   CHATTTS_SPEAKER_FILE=/home/gc/gcdev/ttsserver/speakers/seed_492.pt
+# - 如果显式设置 CHATTTS_SPEAKER_FILE=""，则回退到原来的 seed 生成方式。
+SPEAKER_DIR = os.path.abspath(
+    os.path.expanduser(
+        os.getenv("CHATTTS_SPEAKER_DIR", os.path.join(BASE_DIR, "speakers"))
+    )
+)
+SPEAKER_FILE = os.getenv("CHATTTS_SPEAKER_FILE", "seed_492.pt").strip()
+SPEAKER_SEED = int(os.getenv("CHATTTS_SPEAKER_SEED", "2222"))
 
 # These defaults are tuned for the ESP32 low-latency device speech use case.
 # RTX3090 measurements: batch=24, pass_first=0 -> ~0.17s warm first PCM,
@@ -72,6 +89,8 @@ logger = logging.getLogger("ttsserver")
 
 _chat: ChatTTS.Chat | None = None
 _speaker_embedding: str | None = None
+_speaker_mode = "not-loaded"
+_speaker_file_in_use: str | None = None
 _warmup_ok = False
 _warmup_elapsed = 0.0
 
@@ -99,9 +118,73 @@ class TTSRequest(BaseModel):
     refine_prompt: str = ""
 
 
+def _encode_spk_emb(spk_emb: torch.Tensor) -> str:
+    """Convert a saved speaker tensor to ChatTTS 0.2.5's string format."""
+    if not isinstance(spk_emb, torch.Tensor):
+        raise TypeError(
+            f"Speaker .pt must contain a torch.Tensor, got {type(spk_emb).__name__}"
+        )
+    if spk_emb.numel() == 0:
+        raise ValueError("Speaker .pt contains an empty tensor")
+
+    with torch.no_grad():
+        arr = spk_emb.to(dtype=torch.float16, device="cpu").numpy()
+        encoded = b14.encode_to_string(
+            lzma.compress(
+                arr.tobytes(),
+                format=lzma.FORMAT_RAW,
+                filters=[
+                    {
+                        "id": lzma.FILTER_LZMA2,
+                        "preset": 9 | lzma.PRESET_EXTREME,
+                    }
+                ],
+            )
+        )
+        del arr
+    return encoded
+
+
+def _resolve_speaker_file() -> str | None:
+    """Resolve CHATTTS_SPEAKER_FILE against CHATTTS_SPEAKER_DIR."""
+    if not SPEAKER_FILE:
+        return None
+
+    path = os.path.expanduser(SPEAKER_FILE)
+    if not os.path.isabs(path):
+        path = os.path.join(SPEAKER_DIR, path)
+    return os.path.abspath(path)
+
+
+def _load_speaker(chat: ChatTTS.Chat) -> tuple[str, str, str | None]:
+    """Load a fixed .pt speaker, or explicitly fall back to speaker seed mode."""
+    speaker_path = _resolve_speaker_file()
+
+    if speaker_path is not None:
+        if not os.path.isfile(speaker_path):
+            raise RuntimeError(
+                "Configured speaker file does not exist: "
+                f"{speaker_path}. Put the .pt file there, change "
+                "CHATTTS_SPEAKER_FILE, or set CHATTTS_SPEAKER_FILE='' "
+                "to use seed fallback mode."
+            )
+
+        logger.info("Loading fixed speaker embedding from %s", speaker_path)
+        speaker_tensor = torch.load(speaker_path, map_location="cpu")
+        speaker_embedding = _encode_spk_emb(speaker_tensor)
+        logger.info("Fixed speaker loaded successfully: %s", speaker_path)
+        return speaker_embedding, "file", speaker_path
+
+    logger.warning(
+        "CHATTTS_SPEAKER_FILE is empty; generating speaker from seed=%d",
+        SPEAKER_SEED,
+    )
+    torch.manual_seed(SPEAKER_SEED)
+    return chat.sample_random_speaker(), "seed", None
+
+
 def _float_audio_to_pcm16_bytes(wav: np.ndarray) -> bytes:
     """Convert ChatTTS float waveform to signed little-endian PCM16 bytes."""
-
     audio = np.asarray(wav, dtype=np.float32)
     if audio.size == 0:
         return b""
@@ -144,7 +227,6 @@ def _build_infer_params(req: TTSRequest) -> tuple:
 
 def _pcm_stream(request_id: str, req: TTSRequest) -> Generator[bytes, None, None]:
     """Run ChatTTS and yield PCM blocks as soon as ChatTTS produces them."""
-
     if _chat is None or not _chat.has_loaded():
         raise RuntimeError("ChatTTS model is not loaded")
 
@@ -300,7 +382,6 @@ def _pcm_stream(request_id: str, req: TTSRequest) -> Generator[bytes, None, None
 
 def _run_startup_warmup() -> tuple[bool, float]:
     """Run one tiny inference and discard PCM to warm CUDA/PyTorch caches."""
-
     if not WARMUP_ENABLED:
         logger.info("Startup warmup disabled by CHATTTS_WARMUP=0")
         return False, 0.0
@@ -336,7 +417,8 @@ def _run_startup_warmup() -> tuple[bool, float]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _chat, _speaker_embedding, _warmup_ok, _warmup_elapsed
+    global _chat, _speaker_embedding, _speaker_mode, _speaker_file_in_use
+    global _warmup_ok, _warmup_elapsed
 
     startup_started = time.perf_counter()
     logger.info(
@@ -355,23 +437,32 @@ async def lifespan(_: FastAPI):
             "Check network/model cache and server logs."
         )
 
-    # Sample one speaker embedding once at server startup. Reusing this
-    # embedding makes the device voice stable across different TTS requests.
+    # Load the selected speaker once at startup and reuse it for every request.
     speaker_started = time.perf_counter()
-    torch.manual_seed(SPEAKER_SEED)
-    speaker_embedding = chat.sample_random_speaker()
+    speaker_embedding, speaker_mode, speaker_path = _load_speaker(chat)
     speaker_elapsed = time.perf_counter() - speaker_started
 
     _chat = chat
     _speaker_embedding = speaker_embedding
+    _speaker_mode = speaker_mode
+    _speaker_file_in_use = speaker_path
 
-    logger.info(
-        "ChatTTS model ready: device=%s speaker_seed=%d native_pcm=%dHz/%dbit/mono",
-        getattr(chat, "device", "unknown"),
-        SPEAKER_SEED,
-        CHAT_TTS_SAMPLE_RATE,
-        PCM_BITS_PER_SAMPLE,
-    )
+    if speaker_mode == "file":
+        logger.info(
+            "ChatTTS model ready: device=%s speaker_file=%s native_pcm=%dHz/%dbit/mono",
+            getattr(chat, "device", "unknown"),
+            speaker_path,
+            CHAT_TTS_SAMPLE_RATE,
+            PCM_BITS_PER_SAMPLE,
+        )
+    else:
+        logger.info(
+            "ChatTTS model ready: device=%s speaker_seed=%d native_pcm=%dHz/%dbit/mono",
+            getattr(chat, "device", "unknown"),
+            SPEAKER_SEED,
+            CHAT_TTS_SAMPLE_RATE,
+            PCM_BITS_PER_SAMPLE,
+        )
 
     _warmup_ok, _warmup_elapsed = _run_startup_warmup()
 
@@ -403,13 +494,15 @@ async def lifespan(_: FastAPI):
                 logger.exception("ChatTTS unload failed")
         _chat = None
         _speaker_embedding = None
+        _speaker_mode = "not-loaded"
+        _speaker_file_in_use = None
         _warmup_ok = False
         _warmup_elapsed = 0.0
 
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -423,7 +516,15 @@ def health() -> dict:
         "model_source": MODEL_SOURCE,
         "device": str(getattr(_chat, "device", "not-loaded")),
         "busy": _inference_lock.locked(),
+        # 保留 speaker_seed 字段兼容现有检查脚本；file 模式下它只是 fallback 值。
         "speaker_seed": SPEAKER_SEED,
+        "speaker": {
+            "mode": _speaker_mode,
+            "file": _speaker_file_in_use,
+            "configured_file": SPEAKER_FILE or None,
+            "directory": SPEAKER_DIR,
+            "fallback_seed": SPEAKER_SEED,
+        },
         "warmup": {
             "enabled": WARMUP_ENABLED,
             "ok": _warmup_ok,
