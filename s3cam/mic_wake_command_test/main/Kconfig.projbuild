@@ -2,12 +2,16 @@ menu "ChatTTS / uplink network"
 
 config TTS_SERVER_URL
     string "ChatTTS streaming URL"
-    default ""
+    default "http://192.168.1.92:8000/tts/stream"
     help
-        ChatTTS streaming endpoint used by the ESP32 status-query command.
-        Example: http://192.168.1.20:8000/tts/stream
+        ChatTTS streaming endpoint used by startup prompts, status queries,
+        and dialog-mode voice feedback.
 
-        Leave empty to disable TTS playback while keeping the rest of the
+        Current verified development server:
+        http://192.168.1.92:8000/tts/stream
+
+        Set this to an empty string in menuconfig only when you explicitly
+        want to disable TTS playback while keeping the rest of the
         voice/camera application working normally.
 
 config TTS_WIFI_STA_ENABLE
