@@ -17,6 +17,7 @@
  *      -> camera_capture_one()
  *      -> 保存 JPEG
  *      -> 同步播放 shutter.wav
+ *      -> TTS 播放“拍照完成”
  *
  *   “状态查询 / 模式提示 / 启动介绍”
  *      -> 业务逻辑只生成播报文本并投递到 TTS Queue
@@ -73,6 +74,7 @@ static const char *TAG = "voice_cmd";
 #define STARTUP_TTS_TEXT \
     "系统启动完成。我是小智。说你好小智唤醒我，可以拍照、查询状态或进入对话模式。"
 #define WAKE_REPLY_TTS_TEXT "我在，有什么需要"
+#define PHOTO_DONE_TTS_TEXT "拍照完成"
 
 /* ========================================================================
  * 1. INMP441 / I2S0 RX 配置
@@ -372,6 +374,14 @@ static bool execute_voice_command(int command_id)
         if (play_camera_shutter_sound() != ESP_OK) {
             ESP_LOGW(TAG,
                      "ACTION: 照片已经拍摄成功，只是快门音播放失败");
+        }
+
+        /* 快门音播放结束并释放 Speaker 后，再异步播报“拍照完成”。 */
+        esp_err_t photo_done_err = queue_tts_text(PHOTO_DONE_TTS_TEXT);
+        if (photo_done_err != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "ACTION: 照片已拍摄成功，但“拍照完成”TTS 入队失败: %s",
+                     esp_err_to_name(photo_done_err));
         }
 
         ESP_LOGI(TAG, "ACTION: 浏览器 http://192.168.4.1/ 会自动显示最新照片");
