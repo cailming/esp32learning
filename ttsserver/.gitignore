@@ -4,3 +4,4 @@ __pycache__/
 *.wav
 *.pcm
 .DS_Store
+speakers/*.pt
