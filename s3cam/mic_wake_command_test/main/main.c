@@ -12,11 +12,16 @@
  *      -> 保存 JPEG
  *      -> 同步播放 shutter.wav
  *
- *   “状态查询”
- *      -> speech_detect_task 只生成状态文本并投递到 TTS Queue
+ *   “状态查询 / 模式提示 / 启动介绍”
+ *      -> 业务逻辑只生成播报文本并投递到 TTS Queue
  *      -> tts_service_task 独立执行 HTTP / ChatTTS
  *      -> tts_client 内部再使用 PSRAM StreamBuffer + tts_pcm_play_task
  *      -> I2S1 -> MAX98357A
+ *
+ *   “进入对话模式”
+ *      -> 关闭 WakeNet 后持续使用 MultiNet 监听命令
+ *      -> MultiNet 超时后清理状态并继续监听，不重新要求“你好小智”
+ *      -> “退出对话模式”后重新启用 WakeNet
  *
  * 这样语音识别、TTS 网络请求、PCM 播放三层互相解耦，speech_detect_task
  * 不再因为一次 HTTP/TTS 播放而长时间阻塞。
@@ -34,6 +39,7 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -59,6 +65,10 @@
 #endif
 
 static const char *TAG = "voice_cmd";
+
+#define STARTUP_TTS_WAIT_MS 15000U
+#define STARTUP_TTS_TEXT \
+    "系统启动完成。我是小智。说你好小智唤醒我，可以拍照、查询状态或进入对话模式。"
 
 /* ========================================================================
  * 1. INMP441 / I2S0 RX 配置
@@ -115,6 +125,8 @@ typedef enum {
     CMD_SOUND_ON,
     CMD_SOUND_OFF,
     CMD_QUERY_STATUS,
+    CMD_ENTER_DIALOG_MODE,
+    CMD_EXIT_DIALOG_MODE,
     CMD_EXIT_VOICE,
 } voice_command_id_t;
 
@@ -125,17 +137,20 @@ typedef struct {
 } voice_command_def_t;
 
 static const voice_command_def_t s_commands[] = {
-    {CMD_TAKE_PHOTO,    "pai zhao",           "拍照"},
-    {CMD_START_VIDEO,   "kai shi lu xiang",   "开始录像"},
-    {CMD_STOP_VIDEO,    "ting zhi lu xiang",  "停止录像"},
-    {CMD_SOUND_ON,      "da kai sheng yin",   "打开声音"},
-    {CMD_SOUND_OFF,     "guan bi sheng yin",  "关闭声音"},
-    {CMD_QUERY_STATUS,  "zhuang tai cha xun", "状态查询"},
-    {CMD_EXIT_VOICE,    "tui chu yu yin",     "退出语音"},
+    {CMD_TAKE_PHOTO,        "pai zhao",                "拍照"},
+    {CMD_START_VIDEO,       "kai shi lu xiang",        "开始录像"},
+    {CMD_STOP_VIDEO,        "ting zhi lu xiang",       "停止录像"},
+    {CMD_SOUND_ON,          "da kai sheng yin",        "打开声音"},
+    {CMD_SOUND_OFF,         "guan bi sheng yin",       "关闭声音"},
+    {CMD_QUERY_STATUS,      "zhuang tai cha xun",      "状态查询"},
+    {CMD_ENTER_DIALOG_MODE, "jin ru dui hua mo shi",   "进入对话模式"},
+    {CMD_EXIT_DIALOG_MODE,  "tui chu dui hua mo shi",  "退出对话模式"},
+    {CMD_EXIT_VOICE,        "tui chu yu yin",          "退出语音"},
 };
 
 static bool s_video_recording = false;
 static bool s_sound_enabled = true;
+static bool s_dialog_mode = false;
 static uint32_t s_photo_success_count = 0;
 
 /* ========================================================================
@@ -162,6 +177,50 @@ static const char *command_name_from_id(int command_id)
         }
     }
     return "未知命令";
+}
+
+/*
+ * 启动介绍只有在系统已经完成 Wi-Fi/HTTP 初始化后才投递。
+ *
+ * 如果启用了 STA uplink，则额外等待 WIFI_STA_DEF 真正拿到 IPv4 地址，避免：
+ *   photo_http_server_start() 已返回，但 STA 还没 GOT_IP，TTS HTTP 请求就先发出。
+ *
+ * 如果没有启用 STA uplink，则保留一个很短的缓冲时间；这种模式下 TTS Server
+ * 是否可达由实际网络拓扑决定。
+ */
+static esp_err_t wait_tts_network_ready(uint32_t timeout_ms)
+{
+#ifdef CONFIG_TTS_WIFI_STA_ENABLE
+    const TickType_t start_tick = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    for (;;) {
+        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+        if (sta_netif != NULL) {
+            esp_netif_ip_info_t ip_info = {0};
+            esp_err_t err = esp_netif_get_ip_info(sta_netif, &ip_info);
+
+            if (err == ESP_OK && ip_info.ip.addr != 0U) {
+                ESP_LOGI(TAG, "TTS uplink ready: STA has IPv4 address");
+                return ESP_OK;
+            }
+        }
+
+        if ((xTaskGetTickCount() - start_tick) >= timeout_ticks) {
+            ESP_LOGW(TAG,
+                     "TTS uplink wait timeout after %lu ms",
+                     (unsigned long)timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+#else
+    (void)timeout_ms;
+    vTaskDelay(pdMS_TO_TICKS(800));
+    return ESP_OK;
+#endif
 }
 
 /* ========================================================================
@@ -264,13 +323,13 @@ static esp_err_t play_camera_shutter_sound(void)
 }
 
 /*
- * 状态查询不再在 speech_detect_task 内同步执行 HTTP/TTS。
+ * speech_detect_task 不同步执行 HTTP/TTS。
  * 这里只做快速入队，真正播放由常驻 tts_service_task 完成。
  */
 static esp_err_t queue_tts_text(const char *text)
 {
     if (!s_sound_enabled) {
-        ESP_LOGI(TAG, "TTS: 当前声音已关闭，不投递状态播报");
+        ESP_LOGI(TAG, "TTS: 当前声音已关闭，不投递语音播报");
         return ESP_OK;
     }
 
@@ -295,7 +354,10 @@ static esp_err_t queue_tts_text(const char *text)
 /* ========================================================================
  * 7. 业务命令执行
  * ========================================================================
- * 返回 true：本命令结束后立即退出 MultiNet，重新等待唤醒词。
+ * 返回 true：本命令希望结束当前这一轮 MultiNet 命令处理。
+ *
+ * 非对话模式：调用方会退出 command_mode，重新等待唤醒词。
+ * 对话模式：调用方只 clean MultiNet，然后继续留在 command_mode 监听下一条命令。
  */
 static bool execute_voice_command(int command_id)
 {
@@ -316,7 +378,7 @@ static bool execute_voice_command(int command_id)
                      "ACTION: 拍照失败，不播放快门音: %s (0x%x)",
                      esp_err_to_name(capture_err),
                      (unsigned)capture_err);
-            ESP_LOGI(TAG, "ACTION: 本次拍照命令结束，重新等待唤醒词");
+            ESP_LOGI(TAG, "ACTION: 本次拍照命令结束");
             ESP_LOGI(TAG, "====================================================");
             return true;
         }
@@ -336,7 +398,7 @@ static bool execute_voice_command(int command_id)
         }
 
         ESP_LOGI(TAG, "ACTION: 浏览器 http://192.168.4.1/ 会自动显示最新照片");
-        ESP_LOGI(TAG, "ACTION: 本次拍照完成，重新等待唤醒词");
+        ESP_LOGI(TAG, "ACTION: 本次拍照完成");
         ESP_LOGI(TAG, "====================================================");
         return true;
     }
@@ -372,9 +434,10 @@ static bool execute_voice_command(int command_id)
                                                        &latest_sequence);
 
         ESP_LOGI(TAG,
-                 "ACTION: STATUS video=%s, sound=%s, photos=%lu, latest=%s",
+                 "ACTION: STATUS video=%s, sound=%s, dialog=%s, photos=%lu, latest=%s",
                  s_video_recording ? "ON" : "OFF",
                  s_sound_enabled ? "ON" : "OFF",
+                 s_dialog_mode ? "ON" : "OFF",
                  (unsigned long)s_photo_success_count,
                  latest != NULL ? "YES" : "NO");
 
@@ -390,9 +453,10 @@ static bool execute_voice_command(int command_id)
         char status_text[128];
         int n = snprintf(status_text,
                          sizeof(status_text),
-                         "设备正常，当前%s，声音%s。",
+                         "设备正常，当前%s，声音%s，%s。",
                          s_video_recording ? "正在录像" : "未录像",
-                         s_sound_enabled ? "已开启" : "已关闭");
+                         s_sound_enabled ? "已开启" : "已关闭",
+                         s_dialog_mode ? "已进入对话模式" : "未进入对话模式");
 
         if (n > 0 && n < (int)sizeof(status_text)) {
             esp_err_t tts_err = queue_tts_text(status_text);
@@ -406,17 +470,80 @@ static bool execute_voice_command(int command_id)
         }
 
         /*
-         * TTS 已经交给独立 worker；这里立即清理 MultiNet 并返回。
-         * 由于 enqueue 时 speaker guard 已经置 true，audio_feed_task 会暂停 feed，
-         * 所以即使 WakeNet 重新 enable，也不会把正在播放的 TTS 回灌进去。
+         * TTS 已经交给独立 worker；这里立即结束本轮命令。
+         * enqueue 时 speaker guard 已经置 true，audio_feed_task 会暂停 feed，
+         * 所以不会把正在播放的 TTS 回灌进 WakeNet/MultiNet。
          */
-        ESP_LOGI(TAG, "ACTION: 状态查询已入队，立即退出命令模式");
+        ESP_LOGI(TAG, "ACTION: 状态查询已入队，本轮命令结束");
+        ESP_LOGI(TAG, "====================================================");
+        return true;
+    }
+
+    case CMD_ENTER_DIALOG_MODE: {
+        if (s_dialog_mode) {
+            ESP_LOGI(TAG, "ACTION: 已经处于对话模式");
+            esp_err_t tts_err = queue_tts_text("已在对话模式");
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 对话模式提示 TTS 入队失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        } else {
+            s_dialog_mode = true;
+            ESP_LOGI(TAG, "ACTION: DIALOG MODE -> ON");
+            esp_err_t tts_err = queue_tts_text("进入对话模式");
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 进入对话模式 TTS 入队失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        }
+
+        ESP_LOGI(TAG, "ACTION: 对话模式下无需再次说唤醒词");
+        ESP_LOGI(TAG, "====================================================");
+        return false;
+    }
+
+    case CMD_EXIT_DIALOG_MODE: {
+        if (s_dialog_mode) {
+            s_dialog_mode = false;
+            ESP_LOGI(TAG, "ACTION: DIALOG MODE -> OFF");
+
+            esp_err_t tts_err = queue_tts_text("退出对话模式");
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 退出对话模式 TTS 入队失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        } else {
+            ESP_LOGI(TAG, "ACTION: 当前本来就不在对话模式");
+            esp_err_t tts_err = queue_tts_text("当前未进入对话模式");
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 非对话模式提示 TTS 入队失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        }
+
+        ESP_LOGI(TAG, "ACTION: 重新等待唤醒词");
         ESP_LOGI(TAG, "====================================================");
         return true;
     }
 
     case CMD_EXIT_VOICE:
-        ESP_LOGI(TAG, "ACTION: 退出命令模式，重新等待唤醒词");
+        if (s_dialog_mode) {
+            s_dialog_mode = false;
+            ESP_LOGI(TAG, "ACTION: 退出语音，同时关闭对话模式");
+
+            esp_err_t tts_err = queue_tts_text("退出对话模式");
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "ACTION: 退出对话模式 TTS 入队失败: %s",
+                         esp_err_to_name(tts_err));
+            }
+        } else {
+            ESP_LOGI(TAG, "ACTION: 退出命令模式，重新等待唤醒词");
+        }
         ESP_LOGI(TAG, "====================================================");
         return true;
 
@@ -650,8 +777,9 @@ static void speech_detect_task(void *arg)
 
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
-    ESP_LOGI(TAG, "唤醒后可以说：拍照 / 开始录像 / 状态查询 ...");
-    ESP_LOGI(TAG, "状态查询：异步投递到独立 TTS service task");
+    ESP_LOGI(TAG, "唤醒后可以说：拍照 / 状态查询 / 进入对话模式 ...");
+    ESP_LOGI(TAG, "对话模式：进入后无需重复唤醒，直到说“退出对话模式”");
+    ESP_LOGI(TAG, "TTS：状态/模式提示异步投递到独立 service task");
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
@@ -665,7 +793,7 @@ static void speech_detect_task(void *arg)
         if (!command_mode && result->wakeup_state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "****************************************************");
             ESP_LOGI(TAG, "WAKE WORD DETECTED: 你好小智");
-            ESP_LOGI(TAG, "现在请说命令，例如：拍照 / 开始录像 / 状态查询");
+            ESP_LOGI(TAG, "现在请说命令，例如：拍照 / 状态查询 / 进入对话模式");
             ESP_LOGI(TAG, "****************************************************");
 
             s_afe_handle->disable_wakenet(afe_data);
@@ -698,24 +826,38 @@ static void speech_detect_task(void *arg)
                          probability,
                          mn_result->string != NULL ? mn_result->string : "(null)");
 
-                bool exit_voice_mode = execute_voice_command(command_id);
+                bool end_command_round = execute_voice_command(command_id);
 
-                if (exit_voice_mode) {
+                if (end_command_round) {
                     multinet->clean(model_data);
-                    command_mode = false;
-                    s_afe_handle->enable_wakenet(afe_data);
-                    ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
+
+                    if (s_dialog_mode) {
+                        command_mode = true;
+                        ESP_LOGI(TAG,
+                                 "DIALOG MODE: 本轮结束，继续监听下一条命令（无需唤醒词）");
+                    } else {
+                        command_mode = false;
+                        s_afe_handle->enable_wakenet(afe_data);
+                        ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
+                    }
                 }
             }
             continue;
         }
 
         if (mn_state == ESP_MN_STATE_TIMEOUT) {
-            ESP_LOGI(TAG, "COMMAND TIMEOUT: 命令窗口超时");
             multinet->clean(model_data);
-            command_mode = false;
-            s_afe_handle->enable_wakenet(afe_data);
-            ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
+
+            if (s_dialog_mode) {
+                command_mode = true;
+                ESP_LOGI(TAG,
+                         "DIALOG TIMEOUT: 本轮没有识别到命令，继续保持对话模式监听");
+            } else {
+                ESP_LOGI(TAG, "COMMAND TIMEOUT: 命令窗口超时");
+                command_mode = false;
+                s_afe_handle->enable_wakenet(afe_data);
+                ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
+            }
         }
     }
 
@@ -735,6 +877,7 @@ void app_main(void)
     ESP_LOGI(TAG, "INMP441  : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
     ESP_LOGI(TAG, "Speaker  : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
+    ESP_LOGI(TAG, "Dialog   : 进入对话模式 / 退出对话模式");
     ESP_LOGI(TAG, "Web      : S3CAM-Photo -> http://192.168.4.1/");
     ESP_LOGI(TAG,
              "TTS      : %s",
@@ -759,7 +902,7 @@ void app_main(void)
 
     /*
      * 启动常驻 TTS service。它此时只阻塞等待 Queue，不会主动访问网络。
-     * 状态查询发生时，speech_detect_task 只负责 enqueue。
+     * 状态查询、对话模式提示和启动介绍都只负责 enqueue。
      */
     ESP_ERROR_CHECK(tts_service_start(s_speaker_tx,
                                       CONFIG_TTS_SERVER_URL,
@@ -833,9 +976,15 @@ void app_main(void)
      */
     ESP_ERROR_CHECK(photo_http_server_start());
 
+    esp_err_t tts_network_err = ESP_OK;
+    if (strlen(CONFIG_TTS_SERVER_URL) > 0U) {
+        tts_network_err = wait_tts_network_ready(STARTUP_TTS_WAIT_MS);
+    }
+
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "SYSTEM READY");
-    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照 / 状态查询");
+    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照 / 状态查询 / 进入对话模式");
+    ESP_LOGI(TAG, "Dialog: 进入后持续监听 -> 退出对话模式");
     ESP_LOGI(TAG, "Wi-Fi : S3CAM-Photo / 12345678");
     ESP_LOGI(TAG, "Web   : http://192.168.4.1/");
     ESP_LOGI(TAG,
@@ -844,4 +993,27 @@ void app_main(void)
                  ? CONFIG_TTS_SERVER_URL
                  : "disabled until configured");
     ESP_LOGI(TAG, "====================================================");
+
+    /*
+     * 到这里 Camera / MIC / Speaker / ESP-SR / Wi-Fi / HTTP / TTS Queue 都已启动。
+     * 因此现在才播放开机介绍，满足“程序启动加载完毕以后再播报”的要求。
+     */
+    if (strlen(CONFIG_TTS_SERVER_URL) > 0U) {
+        if (tts_network_err == ESP_OK) {
+            esp_err_t intro_err = queue_tts_text(STARTUP_TTS_TEXT);
+            if (intro_err == ESP_OK) {
+                ESP_LOGI(TAG, "STARTUP TTS: intro queued");
+            } else {
+                ESP_LOGW(TAG,
+                         "STARTUP TTS: enqueue failed: %s",
+                         esp_err_to_name(intro_err));
+            }
+        } else {
+            ESP_LOGW(TAG,
+                     "STARTUP TTS: skip intro because uplink is not ready: %s",
+                     esp_err_to_name(tts_network_err));
+        }
+    } else {
+        ESP_LOGW(TAG, "STARTUP TTS: skipped because CONFIG_TTS_SERVER_URL is empty");
+    }
 }
