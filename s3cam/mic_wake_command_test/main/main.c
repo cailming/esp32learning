@@ -7,6 +7,12 @@
  *                                      -> speech_detect_task
  *                                      -> WakeNet / MultiNet
  *
+ *   “你好小智”
+ *      -> WakeNet 唤醒
+ *      -> TTS 回复“我在，有什么需要”
+ *      -> 播报期间暂停 MIC -> AFE feed，避免设备自己的声音被再次识别
+ *      -> 播报完成后继续等待 MultiNet 命令
+ *
  *   “拍照”
  *      -> camera_capture_one()
  *      -> 保存 JPEG
@@ -22,9 +28,6 @@
  *      -> 关闭 WakeNet 后持续使用 MultiNet 监听命令
  *      -> MultiNet 超时后清理状态并继续监听，不重新要求“你好小智”
  *      -> “退出对话模式”后重新启用 WakeNet
- *
- * 这样语音识别、TTS 网络请求、PCM 播放三层互相解耦，speech_detect_task
- * 不再因为一次 HTTP/TTS 播放而长时间阻塞。
  */
 
 #include <assert.h>
@@ -69,6 +72,7 @@ static const char *TAG = "voice_cmd";
 #define STARTUP_TTS_WAIT_MS 15000U
 #define STARTUP_TTS_TEXT \
     "系统启动完成。我是小智。说你好小智唤醒我，可以拍照、查询状态或进入对话模式。"
+#define WAKE_REPLY_TTS_TEXT "我在，有什么需要"
 
 /* ========================================================================
  * 1. INMP441 / I2S0 RX 配置
@@ -96,14 +100,7 @@ static SemaphoreHandle_t s_speaker_mutex = NULL;
 
 /*
  * Speaker guard：只要快门音或 TTS 正在等待/使用 Speaker，就保持 true。
- *
- * audio_feed_task 在 guard=true 时仍持续读取 MIC I2S0，避免 RX DMA 堵住，
- * 但暂停向 AFE feed()：
- *   1. 防止扬声器声音被麦克风再次拾取后回灌 WakeNet/MultiNet；
- *   2. TTS 期间 speech_detect_task 最终会阻塞在 AFE fetch，暂停 feed 可以避免
- *      AFE ringbuffer 再次被灌满。
- *
- * tts_service_enqueue() 会在请求一入队时立即把它置 true，而不是等到真正开声后。
+ * audio_feed_task 仍持续读取 MIC I2S0，避免 RX DMA 堵住，但暂停向 AFE feed()。
  */
 static volatile bool s_speaker_playing = false;
 
@@ -179,15 +176,6 @@ static const char *command_name_from_id(int command_id)
     return "未知命令";
 }
 
-/*
- * 启动介绍只有在系统已经完成 Wi-Fi/HTTP 初始化后才投递。
- *
- * 如果启用了 STA uplink，则额外等待 WIFI_STA_DEF 真正拿到 IPv4 地址，避免：
- *   photo_http_server_start() 已返回，但 STA 还没 GOT_IP，TTS HTTP 请求就先发出。
- *
- * 如果没有启用 STA uplink，则保留一个很短的缓冲时间；这种模式下 TTS Server
- * 是否可达由实际网络拓扑决定。
- */
 static esp_err_t wait_tts_network_ready(uint32_t timeout_ms)
 {
 #ifdef CONFIG_TTS_WIFI_STA_ENABLE
@@ -258,12 +246,6 @@ static esp_err_t init_speaker_i2s(void)
                         TAG,
                         "speaker i2s_channel_init_std_mode failed");
 
-    /*
-     * 初始化完成后不立即 enable。
-     * TTS/快门真正播放前会自行：disable(允许已停) -> reconfig clock -> enable。
-     * 空闲时不输出无意义 I2S 时钟，也避免 MAX98357A 空转产生杂音。
-     */
-
     s_speaker_mutex = xSemaphoreCreateMutex();
     if (s_speaker_mutex == NULL) {
         ESP_LOGE(TAG, "speaker mutex create failed");
@@ -294,7 +276,6 @@ static void speaker_unlock(void)
     }
 }
 
-/* 真正的 Camera 拍照成功以后才调用此函数播放确认音。 */
 static esp_err_t play_camera_shutter_sound(void)
 {
     if (!s_sound_enabled) {
@@ -311,7 +292,6 @@ static esp_err_t play_camera_shutter_sound(void)
 
     esp_err_t err = shutter_wav_play(s_speaker_tx);
 
-    /* 留 120ms 声学保护时间，让 Speaker 尾音衰减。 */
     vTaskDelay(pdMS_TO_TICKS(120));
     s_speaker_playing = false;
     speaker_unlock();
@@ -322,10 +302,6 @@ static esp_err_t play_camera_shutter_sound(void)
     return err;
 }
 
-/*
- * speech_detect_task 不同步执行 HTTP/TTS。
- * 这里只做快速入队，真正播放由常驻 tts_service_task 完成。
- */
 static esp_err_t queue_tts_text(const char *text)
 {
     if (!s_sound_enabled) {
@@ -353,12 +329,7 @@ static esp_err_t queue_tts_text(const char *text)
 
 /* ========================================================================
  * 7. 业务命令执行
- * ========================================================================
- * 返回 true：本命令希望结束当前这一轮 MultiNet 命令处理。
- *
- * 非对话模式：调用方会退出 command_mode，重新等待唤醒词。
- * 对话模式：调用方只 clean MultiNet，然后继续留在 command_mode 监听下一条命令。
- */
+ * ======================================================================== */
 static bool execute_voice_command(int command_id)
 {
     ESP_LOGI(TAG, "====================================================");
@@ -469,11 +440,6 @@ static bool execute_voice_command(int command_id)
             ESP_LOGE(TAG, "ACTION: status text build failed");
         }
 
-        /*
-         * TTS 已经交给独立 worker；这里立即结束本轮命令。
-         * enqueue 时 speaker guard 已经置 true，audio_feed_task 会暂停 feed，
-         * 所以不会把正在播放的 TTS 回灌进 WakeNet/MultiNet。
-         */
         ESP_LOGI(TAG, "ACTION: 状态查询已入队，本轮命令结束");
         ESP_LOGI(TAG, "====================================================");
         return true;
@@ -732,7 +698,7 @@ static esp_err_t configure_multinet_commands(void)
 }
 
 /* ========================================================================
- * 11. Detect Task：WakeNet10 -> MultiNet6 -> Execute
+ * 11. Detect Task：WakeNet10 -> TTS ACK -> MultiNet6 -> Execute
  * ======================================================================== */
 static void speech_detect_task(void *arg)
 {
@@ -777,9 +743,9 @@ static void speech_detect_task(void *arg)
 
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
-    ESP_LOGI(TAG, "唤醒后可以说：拍照 / 状态查询 / 进入对话模式 ...");
+    ESP_LOGI(TAG, "唤醒后 TTS 回复：我在，有什么需要");
+    ESP_LOGI(TAG, "然后可以说：拍照 / 状态查询 / 进入对话模式 ...");
     ESP_LOGI(TAG, "对话模式：进入后无需重复唤醒，直到说“退出对话模式”");
-    ESP_LOGI(TAG, "TTS：状态/模式提示异步投递到独立 service task");
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
@@ -790,15 +756,35 @@ static void speech_detect_task(void *arg)
             break;
         }
 
+        /*
+         * TTS/快门音播放期间，audio_feed_task 已经暂停向 AFE 写入新数据。
+         * 这里再把 AFE 中播放前残留的旧帧直接丢弃，避免：
+         *   1. “你好小智”的尾音被 MultiNet 当成命令；
+         *   2. Speaker 刚开始播放时残留数据进入命令识别；
+         *   3. 设备自己的 TTS 回复参与识别。
+         */
+        if (s_speaker_playing) {
+            continue;
+        }
+
         if (!command_mode && result->wakeup_state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "****************************************************");
             ESP_LOGI(TAG, "WAKE WORD DETECTED: 你好小智");
-            ESP_LOGI(TAG, "现在请说命令，例如：拍照 / 状态查询 / 进入对话模式");
+            ESP_LOGI(TAG, "ESP32 回复: %s", WAKE_REPLY_TTS_TEXT);
             ESP_LOGI(TAG, "****************************************************");
 
             s_afe_handle->disable_wakenet(afe_data);
             multinet->clean(model_data);
             command_mode = true;
+
+            esp_err_t wake_tts_err = queue_tts_text(WAKE_REPLY_TTS_TEXT);
+            if (wake_tts_err != ESP_OK) {
+                ESP_LOGW(TAG,
+                         "WAKE ACK TTS enqueue failed: %s；仍继续等待语音命令",
+                         esp_err_to_name(wake_tts_err));
+            }
+
+            continue;
         }
 
         if (!command_mode) {
@@ -871,12 +857,23 @@ static void speech_detect_task(void *arg)
  * ======================================================================== */
 void app_main(void)
 {
+    /*
+     * ESP-SR 的 AFE 在启动阶段可能先收到几帧 feed，而 Detect Task 还在初始化
+     * MultiNet 命令表，因此偶尔会输出：
+     *   Ringbuffer of AFE(FEED) is full ...
+     *
+     * 这是启动阶段的瞬时 warning，不影响后续识别。这里仅屏蔽 AFE 的 W/I 日志，
+     * 真正的 ESP_LOGE 错误仍然保留。
+     */
+    esp_log_level_set("AFE", ESP_LOG_ERROR);
+
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ASYNC ChatTTS + WEB");
     ESP_LOGI(TAG, "Camera   : OV3660 / VGA JPEG / real capture");
     ESP_LOGI(TAG, "INMP441  : BCLK=42 WS=41 DIN=1 (I2S0 RX / LEFT)");
     ESP_LOGI(TAG, "Speaker  : BCLK=14 LRC=3 DOUT=46 (I2S1 TX)");
     ESP_LOGI(TAG, "WakeNet10: 你好小智 (wn10_nihaoxiaozhi)");
+    ESP_LOGI(TAG, "Wake ACK : %s", WAKE_REPLY_TTS_TEXT);
     ESP_LOGI(TAG, "Dialog   : 进入对话模式 / 退出对话模式");
     ESP_LOGI(TAG, "Web      : S3CAM-Photo -> http://192.168.4.1/");
     ESP_LOGI(TAG,
@@ -895,28 +892,21 @@ void app_main(void)
                  "WakeNet + MultiNet + Wi-Fi + TTS Buffer 也可能受内存限制影响。");
     }
 
-    /* 核心硬件。 */
     ESP_ERROR_CHECK(camera_capture_init());
     ESP_ERROR_CHECK(init_mic_i2s());
     ESP_ERROR_CHECK(init_speaker_i2s());
 
-    /*
-     * 启动常驻 TTS service。它此时只阻塞等待 Queue，不会主动访问网络。
-     * 状态查询、对话模式提示和启动介绍都只负责 enqueue。
-     */
     ESP_ERROR_CHECK(tts_service_start(s_speaker_tx,
                                       CONFIG_TTS_SERVER_URL,
                                       s_speaker_mutex,
                                       &s_speaker_playing));
 
-    /* 从 model 分区加载 WakeNet10 / MultiNet6。 */
     s_models = esp_srmodel_init("model");
     if (s_models == NULL) {
         ESP_LOGE(TAG, "esp_srmodel_init(model) failed");
         return;
     }
 
-    /* 单麦克风输入，不提供 playback reference。 */
     afe_config_t *afe_config = afe_config_init("M",
                                                s_models,
                                                AFE_TYPE_SR,
@@ -951,10 +941,6 @@ void app_main(void)
                                                  NULL,
                                                  0);
 
-    /*
-     * 之前 speech_detect_task 同步承载 HTTP/TTS，所以给了 14KB 栈。
-     * 现在它只做 ESP-SR + 业务调度，恢复到更合理的 10KB。
-     */
     BaseType_t detect_ok = xTaskCreatePinnedToCore(speech_detect_task,
                                                    "speech_detect",
                                                    10 * 1024,
@@ -969,11 +955,6 @@ void app_main(void)
         return;
     }
 
-    /*
-     * 最后启动 Wi-Fi + Photo HTTP Server。
-     * 若 menuconfig 开启 STA uplink，则保持 S3CAM-Photo SoftAP 的同时接入局域网，
-     * 供 TTS service 访问 RTX3090。
-     */
     ESP_ERROR_CHECK(photo_http_server_start());
 
     esp_err_t tts_network_err = ESP_OK;
@@ -983,7 +964,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "SYSTEM READY");
-    ESP_LOGI(TAG, "Voice : 你好小智 -> 拍照 / 状态查询 / 进入对话模式");
+    ESP_LOGI(TAG, "Voice : 你好小智 -> 我在，有什么需要 -> 语音命令");
     ESP_LOGI(TAG, "Dialog: 进入后持续监听 -> 退出对话模式");
     ESP_LOGI(TAG, "Wi-Fi : S3CAM-Photo / 12345678");
     ESP_LOGI(TAG, "Web   : http://192.168.4.1/");
@@ -994,10 +975,6 @@ void app_main(void)
                  : "disabled until configured");
     ESP_LOGI(TAG, "====================================================");
 
-    /*
-     * 到这里 Camera / MIC / Speaker / ESP-SR / Wi-Fi / HTTP / TTS Queue 都已启动。
-     * 因此现在才播放开机介绍，满足“程序启动加载完毕以后再播报”的要求。
-     */
     if (strlen(CONFIG_TTS_SERVER_URL) > 0U) {
         if (tts_network_err == ESP_OK) {
             esp_err_t intro_err = queue_tts_text(STARTUP_TTS_TEXT);
