@@ -112,6 +112,12 @@ static esp_afe_sr_data_t *s_afe_data = NULL;
 static srmodel_list_t *s_models = NULL;
 static volatile bool s_running = true;
 
+/*
+ * Detect Task 完成 MultiNet 创建和命令表配置之前，Feed Task 只读取 MIC I2S，
+ * 不向 AFE feed。这样启动阶段 AFE 不会因为“只写不读”而把 ringbuffer 塞满。
+ */
+static volatile bool s_detector_ready = false;
+
 /* ========================================================================
  * 4. 语音命令定义
  * ======================================================================== */
@@ -632,6 +638,14 @@ static void audio_feed_task(void *arg)
             break;
         }
 
+        /*
+         * Detect Task 尚未完成 MultiNet 初始化时，只排空 MIC DMA，不向 AFE 写入。
+         * 等 s_detector_ready=true 后，AFE 才开始正常的 feed/fetch 配对。
+         */
+        if (!s_detector_ready) {
+            continue;
+        }
+
         if (s_speaker_playing) {
             if ((++frame_count % 100) == 0) {
                 ESP_LOGI(TAG, "MIC alive: speaker guard, AFE feed paused");
@@ -741,6 +755,9 @@ static void speech_detect_task(void *arg)
 
     bool command_mode = false;
 
+    /* 从这一刻开始 Detect Task 已经可以持续 fetch，允许 Feed Task 正式向 AFE 写入。 */
+    s_detector_ready = true;
+
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "READY: 等待唤醒词 -> 你好小智");
     ESP_LOGI(TAG, "唤醒后 TTS 回复：我在，有什么需要");
@@ -847,6 +864,7 @@ static void speech_detect_task(void *arg)
         }
     }
 
+    s_detector_ready = false;
     multinet->destroy(model_data);
     ESP_LOGW(TAG, "speech_detect_task exit");
     vTaskDelete(NULL);
@@ -857,16 +875,6 @@ static void speech_detect_task(void *arg)
  * ======================================================================== */
 void app_main(void)
 {
-    /*
-     * ESP-SR 的 AFE 在启动阶段可能先收到几帧 feed，而 Detect Task 还在初始化
-     * MultiNet 命令表，因此偶尔会输出：
-     *   Ringbuffer of AFE(FEED) is full ...
-     *
-     * 这是启动阶段的瞬时 warning，不影响后续识别。这里仅屏蔽 AFE 的 W/I 日志，
-     * 真正的 ESP_LOGE 错误仍然保留。
-     */
-    esp_log_level_set("AFE", ESP_LOG_ERROR);
-
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ASYNC ChatTTS + WEB");
     ESP_LOGI(TAG, "Camera   : OV3660 / VGA JPEG / real capture");
