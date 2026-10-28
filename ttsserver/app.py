@@ -110,7 +110,7 @@ class TTSRequest(BaseModel):
         description="Text to synthesize. Optimized for short device prompts/status messages.",
     )
     lang: Literal["zh", "en"] = "zh"
-    speed: int = Field(5, ge=1, le=9)
+    speed: int = Field(3, ge=1, le=9)
     temperature: float = Field(0.3, ge=0.05, le=1.0)
     top_p: float = Field(0.7, gt=0.0, le=1.0)
     top_k: int = Field(20, ge=1, le=100)
