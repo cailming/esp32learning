@@ -5,15 +5,19 @@ config TTS_SERVER_URL
     default "http://192.168.1.92:8000/tts/stream"
     help
         ChatTTS streaming endpoint used by startup prompts, status queries,
-        and dialog-mode voice feedback.
+        and local voice feedback.
 
 config ASR_SERVER_URL
     string "FunASR recognition URL"
     default "http://192.168.1.92:8001/asr"
     help
-        HTTP endpoint for dialog-mode speech recognition.
-        ESP32 sends application/octet-stream containing 16 kHz, PCM16LE,
-        mono audio and expects JSON such as {"text":"你好"}.
+        Base FunASR endpoint for dialog mode. Keep this value ending in /asr.
+        The ESP32 dialog client automatically replaces the trailing /asr with
+        /dialog when running the speech-to-speech path:
+
+            ESP32 PCM -> /dialog -> FunASR -> ChatTTS -> PCM -> ESP32 Speaker
+
+        The original /asr endpoint remains available for standalone ASR tests.
 
 config ASR_VAD_PEAK_THRESHOLD
     int "Dialog VAD peak threshold"
