@@ -261,3 +261,21 @@ esp_err_t tts_service_enqueue(const char *text)
     ESP_LOGI(TAG, "Queued TTS job asynchronously: %s", job.text);
     return ESP_OK;
 }
+
+esp_err_t tts_service_get_playback_context(i2s_chan_handle_t *tx_chan,
+                                           SemaphoreHandle_t *speaker_mutex,
+                                           volatile bool **speaker_guard)
+{
+    if (tx_chan == NULL || speaker_mutex == NULL || speaker_guard == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_tx_chan == NULL || s_speaker_mutex == NULL || s_speaker_guard == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *tx_chan = s_tx_chan;
+    *speaker_mutex = s_speaker_mutex;
+    *speaker_guard = s_speaker_guard;
+    return ESP_OK;
+}
