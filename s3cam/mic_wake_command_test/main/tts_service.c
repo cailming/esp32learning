@@ -19,6 +19,11 @@ static const char *TAG = "tts_service";
 #define TTS_ACOUSTIC_GUARD_MS    120U
 #define TTS_SERVER_URL_MAX       256U
 
+#define OLD_WAKE_REPLY_TEXT       "我在，有什么需要"
+#define OLD_WAKE_REPLY_TEXT_ALT   "我在，有什么需求"
+#define SHORT_WAKE_REPLY_TEXT     "在呢"
+#define CHINESE_FULL_STOP         "。"
+
 typedef struct {
     char text[TTS_JOB_TEXT_MAX];
 } tts_job_t;
@@ -34,6 +39,80 @@ static void release_speaker_guard(void)
     if (s_speaker_guard != NULL) {
         *s_speaker_guard = false;
     }
+}
+
+static bool text_ends_with(const char *text, const char *suffix)
+{
+    const size_t text_len = strlen(text);
+    const size_t suffix_len = strlen(suffix);
+
+    if (suffix_len > text_len) {
+        return false;
+    }
+
+    return memcmp(text + text_len - suffix_len, suffix, suffix_len) == 0;
+}
+
+static bool has_terminal_punctuation(const char *text)
+{
+    static const char *const endings[] = {
+        "。", "！", "？", "；", "……", ".", "!", "?", ";",
+    };
+
+    for (size_t i = 0; i < sizeof(endings) / sizeof(endings[0]); ++i) {
+        if (text_ends_with(text, endings[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
+ * 统一整理真正送给 ChatTTS 的文本：
+ * 1. 旧版唤醒回复“我在，有什么需要/需求”统一缩短成“在呢”；
+ * 2. 没有句末标点时自动补“。”，让 ChatTTS 有明确的收句信息。
+ *
+ * 第二点主要改善短提示词（例如“在呢”“拍照完成”“进入对话模式”）的尾音，
+ * 避免模型把最后一个字当作仍在句中，从而产生“突然截掉”的听感。
+ */
+static esp_err_t prepare_tts_text(const char *input,
+                                  char *output,
+                                  size_t output_size)
+{
+    if (input == NULL || output == NULL || output_size == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *source = input;
+    if (strcmp(input, OLD_WAKE_REPLY_TEXT) == 0 ||
+        strcmp(input, OLD_WAKE_REPLY_TEXT_ALT) == 0) {
+        source = SHORT_WAKE_REPLY_TEXT;
+    }
+
+    const size_t source_len = strlen(source);
+    const bool add_full_stop = !has_terminal_punctuation(source);
+    const size_t suffix_len = add_full_stop ? strlen(CHINESE_FULL_STOP) : 0U;
+
+    if (source_len + suffix_len + 1U > output_size) {
+        ESP_LOGE(TAG,
+                 "Prepared TTS text too long: source=%u suffix=%u capacity=%u",
+                 (unsigned)source_len,
+                 (unsigned)suffix_len,
+                 (unsigned)output_size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(output, source, source_len);
+    size_t offset = source_len;
+
+    if (add_full_stop) {
+        memcpy(output + offset, CHINESE_FULL_STOP, suffix_len);
+        offset += suffix_len;
+    }
+
+    output[offset] = '\0';
+    return ESP_OK;
 }
 
 static void tts_service_task(void *arg)
@@ -151,15 +230,6 @@ esp_err_t tts_service_enqueue(const char *text)
         return ESP_ERR_INVALID_STATE;
     }
 
-    const size_t text_len = strlen(text);
-    if (text_len >= TTS_JOB_TEXT_MAX) {
-        ESP_LOGE(TAG,
-                 "TTS text too long: %u bytes, max=%u",
-                 (unsigned)text_len,
-                 (unsigned)(TTS_JOB_TEXT_MAX - 1U));
-        return ESP_ERR_INVALID_SIZE;
-    }
-
     /*
      * guard 在“入队前”就置 true，而不是等 worker 真正开始播放后再置。
      * 这样 speech_detect_task 一旦投递成功，audio_feed_task 就会马上暂停向 AFE
@@ -171,7 +241,14 @@ esp_err_t tts_service_enqueue(const char *text)
     }
 
     tts_job_t job = {0};
-    memcpy(job.text, text, text_len + 1U);
+    esp_err_t prepare_err = prepare_tts_text(text, job.text, sizeof(job.text));
+    if (prepare_err != ESP_OK) {
+        return prepare_err;
+    }
+
+    if (strcmp(job.text, text) != 0) {
+        ESP_LOGI(TAG, "TTS text normalized: '%s' -> '%s'", text, job.text);
+    }
 
     *s_speaker_guard = true;
 
