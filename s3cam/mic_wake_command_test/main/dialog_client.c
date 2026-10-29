@@ -52,12 +52,6 @@ typedef struct {
 } dialog_response_headers_t;
 
 /*
- * stereo 临时输出缓冲不再放到 dialog_pcm_play_task 的 6KB 栈里。
- * 对话播放同一时刻只会有一个实例，因此使用单个静态缓冲即可。
- */
-static int16_t s_dialog_stereo_output[(DIALOG_RX_BUFFER_BYTES / 2U + 1U) * 2U];
-
-/*
  * ESP-IDF 6.1 默认不会保存 response headers；
  * esp_http_client_get_response_header() 只有在
  * CONFIG_ESP_HTTP_CLIENT_SAVE_RESPONSE_HEADERS=y 时才会提供。
@@ -177,6 +171,7 @@ static void dialog_pcm_play_task(void *arg)
 {
     dialog_playback_ctx_t *ctx = (dialog_playback_ctx_t *)arg;
     uint8_t pcm[DIALOG_RX_BUFFER_BYTES];
+    int16_t stereo[(DIALOG_RX_BUFFER_BYTES / 2U + 1U) * 2U];
     bool pending_valid = false;
     uint8_t pending_byte = 0;
 
@@ -211,8 +206,8 @@ static void dialog_pcm_play_task(void *arg)
         if (pending_valid && received > 0U) {
             int16_t sample =
                 (int16_t)((uint16_t)pending_byte | ((uint16_t)pcm[0] << 8));
-            s_dialog_stereo_output[0] = sample;
-            s_dialog_stereo_output[1] = sample;
+            stereo[0] = sample;
+            stereo[1] = sample;
             frames = 1;
             index = 1;
             pending_valid = false;
@@ -223,8 +218,8 @@ static void dialog_pcm_play_task(void *arg)
             int16_t sample =
                 (int16_t)((uint16_t)pcm[index] |
                           ((uint16_t)pcm[index + 1U] << 8));
-            s_dialog_stereo_output[frames * 2U] = sample;
-            s_dialog_stereo_output[frames * 2U + 1U] = sample;
+            stereo[frames * 2U] = sample;
+            stereo[frames * 2U + 1U] = sample;
             frames++;
             index += 2U;
             ctx->pcm_bytes_played += 2U;
@@ -237,7 +232,7 @@ static void dialog_pcm_play_task(void *arg)
 
         if (frames > 0U) {
             esp_err_t err = i2s_write_all(ctx->tx_chan,
-                                          (const uint8_t *)s_dialog_stereo_output,
+                                          (const uint8_t *)stereo,
                                           frames * 2U * sizeof(int16_t));
             if (err != ESP_OK) {
                 ctx->consumer_result = err;
