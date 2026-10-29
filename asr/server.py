@@ -1,29 +1,30 @@
-"""FunASR ParaformerStreaming ASR server for macOS Intel CPU.
+"""FunASR + ChatTTS dialog bridge for ESP32-S3.
 
-ESP32 sends 16 kHz / 16-bit / mono little-endian PCM to POST /asr.
-The server runs ParaformerStreaming on CPU and returns JSON.
+Endpoints:
+- GET  /health : health/config information
+- POST /asr    : raw 16kHz PCM16LE mono -> JSON text
+- POST /dialog : raw 16kHz PCM16LE mono -> ASR -> echo processor -> ChatTTS -> raw 24kHz PCM16LE mono
 
-By default this server loads the already-downloaded local FunASR model from:
-    /Users/apple/dev/umfplugin/src/model
-
-The local path can be overridden with ASR_MODEL_PATH. Remote model download is
-disabled by default so an accidentally missing local directory does not trigger
-an online download. Set ASR_ALLOW_REMOTE_MODEL=1 only when remote fallback is
-explicitly desired.
+The first dialog version intentionally uses an echo processor: recognized text is
+sent unchanged to ChatTTS.  Later an LLM can be inserted inside
+``dialog_process_text`` without changing the ESP32 transport/playback path.
 """
 
 from __future__ import annotations
 
+import base64
 import itertools
 import math
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+import requests
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from funasr import AutoModel
 
 SAMPLE_RATE = int(os.getenv("ASR_SAMPLE_RATE", "16000"))
@@ -39,13 +40,23 @@ ALLOW_REMOTE_MODEL = os.getenv("ASR_ALLOW_REMOTE_MODEL", "0").strip().lower() in
     "on",
 }
 
+# ChatTTS service already used by the ESP32 project.
+TTS_SERVER_URL = os.getenv(
+    "ASR_TTS_SERVER_URL",
+    "http://192.168.1.92:8000/tts/stream",
+)
+TTS_SAMPLE_RATE = int(os.getenv("ASR_TTS_SAMPLE_RATE", "24000"))
+TTS_CONNECT_TIMEOUT = float(os.getenv("ASR_TTS_CONNECT_TIMEOUT", "3"))
+TTS_READ_TIMEOUT = float(os.getenv("ASR_TTS_READ_TIMEOUT", "30"))
+TTS_CHUNK_BYTES = int(os.getenv("ASR_TTS_CHUNK_BYTES", "4096"))
+
 # ParaformerStreaming: [0, 10, 5], middle value 10 corresponds to 600 ms.
 CHUNK_SIZE = [0, 10, 5]
 ENCODER_CHUNK_LOOK_BACK = 4
 DECODER_CHUNK_LOOK_BACK = 1
 CHUNK_SAMPLES = CHUNK_SIZE[1] * 60 * SAMPLE_RATE // 1000
 
-app = FastAPI(title="ESP32 FunASR Streaming Server", version="1.2")
+app = FastAPI(title="ESP32 FunASR Dialog Server", version="2.0")
 
 _model_lock = threading.Lock()
 _request_ids = itertools.count(1)
@@ -89,6 +100,7 @@ log(
     f"resolved_path={getattr(model, 'model_path', MODEL_SOURCE)}, "
     f"load={time.perf_counter() - _model_load_started:.3f}s"
 )
+log(f"[DIALOG] TTS upstream: {TTS_SERVER_URL}")
 
 
 def _extract_text(result: Any) -> str:
@@ -153,30 +165,10 @@ def recognize_streaming(pcm: np.ndarray, request_id: int) -> tuple[str, float]:
     return final_text.strip(), infer_elapsed
 
 
-@app.get("/health")
-def health() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "model": str(MODEL_SOURCE),
-        "model_source": MODEL_SOURCE_TYPE,
-        "model_path": str(getattr(model, "model_path", MODEL_SOURCE)),
-        "device": "cpu",
-        "sample_rate": SAMPLE_RATE,
-        "chunk_samples": CHUNK_SAMPLES,
-    }
-
-
-@app.post("/asr")
-async def asr(request: Request) -> dict[str, Any]:
-    request_id = next(_request_ids)
-    request_started = time.perf_counter()
-    client = request.client.host if request.client is not None else "unknown"
-
+def _decode_pcm_request(raw: bytes, request: Request) -> tuple[np.ndarray, int, float, float]:
     content_type = request.headers.get("content-type", "")
     if "application/octet-stream" not in content_type:
         raise HTTPException(415, "expected application/octet-stream PCM")
-
-    raw = await request.body()
     if not raw:
         raise HTTPException(400, "empty PCM body")
     if len(raw) % 2 != 0:
@@ -196,6 +188,116 @@ async def asr(request: Request) -> dict[str, Any]:
     pcm = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     duration_ms = round(len(pcm) * 1000 / SAMPLE_RATE)
     peak, rms = _audio_stats(pcm)
+    return pcm, duration_ms, peak, rms
+
+
+def _recognize_request(pcm: np.ndarray, request_id: int) -> tuple[str, float]:
+    lock_started = time.perf_counter()
+    with _model_lock:
+        lock_wait = time.perf_counter() - lock_started
+        if lock_wait >= 0.001:
+            log(f"[ASR #{request_id}] model lock wait={lock_wait:.3f}s")
+        return recognize_streaming(pcm, request_id)
+
+
+def dialog_process_text(text: str) -> str:
+    """Dialog policy hook. Version 1 simply echoes ASR text back to TTS."""
+    return text.strip()
+
+
+def _tts_request(reply_text: str, request_id: int) -> requests.Response:
+    payload = {
+        "text": reply_text,
+        "lang": "zh",
+        "speed": 3,
+        "skip_refine_text": True,
+    }
+
+    started = time.perf_counter()
+    try:
+        response = requests.post(
+            TTS_SERVER_URL,
+            json=payload,
+            stream=True,
+            timeout=(TTS_CONNECT_TIMEOUT, TTS_READ_TIMEOUT),
+        )
+    except requests.RequestException as exc:
+        log(f"[DIALOG #{request_id}] TTS request failed: {exc}")
+        raise HTTPException(502, f"TTS upstream request failed: {exc}") from exc
+
+    setup_elapsed = time.perf_counter() - started
+    if response.status_code != 200:
+        try:
+            detail = response.text[:500]
+        finally:
+            response.close()
+        log(
+            f"[DIALOG #{request_id}] TTS upstream HTTP {response.status_code}: "
+            f"{detail!r}"
+        )
+        raise HTTPException(
+            502,
+            f"TTS upstream HTTP {response.status_code}: {detail}",
+        )
+
+    log(
+        f"[DIALOG #{request_id}] TTS upstream ready in {setup_elapsed:.3f}s "
+        f"content_type={response.headers.get('content-type', '')!r}"
+    )
+    return response
+
+
+def _iter_tts_pcm(response: requests.Response, request_id: int) -> Iterator[bytes]:
+    total = 0
+    started = time.perf_counter()
+    first_chunk_at: float | None = None
+    try:
+        for chunk in response.iter_content(chunk_size=TTS_CHUNK_BYTES):
+            if not chunk:
+                continue
+            if first_chunk_at is None:
+                first_chunk_at = time.perf_counter()
+                log(
+                    f"[DIALOG #{request_id}] first TTS PCM after "
+                    f"{first_chunk_at - started:.3f}s bytes={len(chunk)}"
+                )
+            total += len(chunk)
+            yield chunk
+    except requests.RequestException as exc:
+        log(f"[DIALOG #{request_id}] TTS stream failed after {total} bytes: {exc}")
+        raise
+    finally:
+        response.close()
+        log(
+            f"[DIALOG #{request_id}] TTS stream done: bytes={total} "
+            f"stream={time.perf_counter() - started:.3f}s"
+        )
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "model": str(MODEL_SOURCE),
+        "model_source": MODEL_SOURCE_TYPE,
+        "model_path": str(getattr(model, "model_path", MODEL_SOURCE)),
+        "device": "cpu",
+        "sample_rate": SAMPLE_RATE,
+        "chunk_samples": CHUNK_SAMPLES,
+        "dialog_tts_url": TTS_SERVER_URL,
+        "dialog_tts_sample_rate": TTS_SAMPLE_RATE,
+        "dialog_processor": "echo",
+    }
+
+
+@app.post("/asr")
+async def asr(request: Request) -> dict[str, Any]:
+    request_id = next(_request_ids)
+    request_started = time.perf_counter()
+    client = request.client.host if request.client is not None else "unknown"
+
+    raw = await request.body()
+    pcm, duration_ms, peak, rms = _decode_pcm_request(raw, request)
 
     log(
         f"[ASR #{request_id}] recv from={client}: bytes={len(raw)} "
@@ -203,12 +305,7 @@ async def asr(request: Request) -> dict[str, Any]:
         f"peak={peak:.4f} rms={rms:.4f}"
     )
 
-    lock_started = time.perf_counter()
-    with _model_lock:
-        lock_wait = time.perf_counter() - lock_started
-        if lock_wait >= 0.001:
-            log(f"[ASR #{request_id}] model lock wait={lock_wait:.3f}s")
-        text, infer_elapsed = recognize_streaming(pcm, request_id)
+    text, infer_elapsed = _recognize_request(pcm, request_id)
 
     total_elapsed = time.perf_counter() - request_started
     audio_seconds = max(duration_ms / 1000.0, 0.001)
@@ -227,6 +324,59 @@ async def asr(request: Request) -> dict[str, Any]:
         "total_ms": round(total_elapsed * 1000),
         "rtf": round(rtf, 3),
     }
+
+
+@app.post("/dialog")
+async def dialog(request: Request) -> Response:
+    """ASR -> echo processor -> ChatTTS, returning raw 24k PCM to ESP32."""
+    request_id = next(_request_ids)
+    request_started = time.perf_counter()
+    client = request.client.host if request.client is not None else "unknown"
+
+    raw = await request.body()
+    pcm, duration_ms, peak, rms = _decode_pcm_request(raw, request)
+
+    log(
+        f"[DIALOG #{request_id}] recv from={client}: bytes={len(raw)} "
+        f"audio={duration_ms / 1000.0:.3f}s peak={peak:.4f} rms={rms:.4f}"
+    )
+
+    text, infer_elapsed = _recognize_request(pcm, request_id)
+    reply_text = dialog_process_text(text)
+    asr_text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    reply_text_b64 = base64.b64encode(reply_text.encode("utf-8")).decode("ascii")
+
+    log(
+        f"[DIALOG #{request_id}] ASR={text!r} -> reply={reply_text!r} "
+        f"infer={infer_elapsed:.3f}s"
+    )
+
+    common_headers = {
+        "X-ASR-Text-B64": asr_text_b64,
+        "X-Reply-Text-B64": reply_text_b64,
+        "X-Audio-Sample-Rate": str(TTS_SAMPLE_RATE),
+        "X-Audio-Format": "s16le",
+        "X-Audio-Channels": "1",
+        "X-Dialog-Processor": "echo",
+    }
+
+    if not reply_text:
+        log(f"[DIALOG #{request_id}] empty ASR text -> 204, no TTS")
+        return Response(status_code=204, headers=common_headers)
+
+    tts_response = _tts_request(reply_text, request_id)
+
+    log(
+        f"[DIALOG #{request_id}] response headers ready: "
+        f"total_before_stream={time.perf_counter() - request_started:.3f}s"
+    )
+
+    return StreamingResponse(
+        _iter_tts_pcm(tts_response, request_id),
+        status_code=200,
+        media_type="application/octet-stream",
+        headers=common_headers,
+    )
 
 
 if __name__ == "__main__":
