@@ -31,6 +31,7 @@ idf_component_register(
     SRCS
         "main_asr.c"
         "asr_client.c"
+        "dialog_client.c"
         "camera_capture.c"
         "shutter_wav_player.c"
         "photo_http_server.c"
@@ -46,6 +47,7 @@ idf_component_register(
         esp_http_client
         nvs_flash
         cjson
+        mbedtls
     PRIV_REQUIRES
         esp_timer
     EMBED_FILES
