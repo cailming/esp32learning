@@ -97,12 +97,23 @@ esp_err_t asr_client_recognize(const char *server_url,
              server_url,
              dialog_url);
 
-    return dialog_client_exchange(dialog_url,
-                                  pcm,
-                                  samples,
-                                  tx_chan,
-                                  speaker_mutex,
-                                  speaker_guard,
-                                  text,
-                                  text_size);
+    /*
+     * 从本轮 HTTP 请求开始就暂停 MIC -> AFE/ASR，而不是等真正播放 TTS 时才暂停。
+     * 这样一次对话严格保持 LISTEN -> PROCESSING -> PLAYING -> LISTEN，避免服务端
+     * 正在做 ASR/TTS 时用户的后续声音继续进入 VAD 队列，重新出现 queue full。
+     */
+    *speaker_guard = true;
+
+    err = dialog_client_exchange(dialog_url,
+                                 pcm,
+                                 samples,
+                                 tx_chan,
+                                 speaker_mutex,
+                                 speaker_guard,
+                                 text,
+                                 text_size);
+
+    /* dialog_client 正常播放结束会自己清 guard；错误/204 路径由这里兜底恢复。 */
+    *speaker_guard = false;
+    return err;
 }
