@@ -1,13 +1,6 @@
 # -----------------------------------------------------------------------------
 # 真实相机快门 WAV
 # -----------------------------------------------------------------------------
-# 第一次配置工程时，从固定 commit 下载 Mozilla / Firefox DevTools 使用的
-# shutter.wav，然后通过 EMBED_FILES 原样打进 ESP32 固件。
-#
-# WAV 放在组件根目录，生成固定链接符号：
-#   _binary_shutter_wav_start
-#   _binary_shutter_wav_end
-#
 set(SHUTTER_SOUND_FILE "${CMAKE_CURRENT_LIST_DIR}/shutter.wav")
 set(SHUTTER_SOUND_URL
     "https://raw.githubusercontent.com/mozilla/gecko-dev/5836a062726f715fda621338a17b51aff30d0a8c/devtools/client/themes/audio/shutter.wav")
@@ -36,7 +29,8 @@ endif()
 
 idf_component_register(
     SRCS
-        "main.c"
+        "main_asr.c"
+        "asr_client.c"
         "camera_capture.c"
         "shutter_wav_player.c"
         "photo_http_server.c"
@@ -51,6 +45,7 @@ idf_component_register(
         esp_http_server
         esp_http_client
         nvs_flash
+        json
     PRIV_REQUIRES
         esp_timer
     EMBED_FILES
