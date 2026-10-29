@@ -10,8 +10,8 @@
  *   “你好小智”
  *      -> WakeNet 唤醒
  *      -> TTS 回复“我在，有什么需要”
- *      -> 播报期间暂停 MIC -> AFE feed，避免设备自己的声音被再次识别
- *      -> 播报完成后继续等待 MultiNet 命令
+ *      -> 播报期间同时暂停 AFE feed/fetch，避免设备自己的声音被再次识别
+ *      -> 播报完成后给 AFE 一个短暂恢复窗口，再继续等待 MultiNet 命令
  *
  *   “拍照”
  *      -> camera_capture_one()
@@ -71,6 +71,7 @@
 static const char *TAG = "voice_cmd";
 
 #define STARTUP_TTS_WAIT_MS 15000U
+#define AFE_RESUME_GUARD_MS 80U
 #define STARTUP_TTS_TEXT \
     "系统启动完成。我是小智。说你好小智唤醒我，可以拍照、查询状态或进入对话模式。"
 #define WAKE_REPLY_TTS_TEXT "我在，有什么需要"
@@ -103,6 +104,7 @@ static SemaphoreHandle_t s_speaker_mutex = NULL;
 /*
  * Speaker guard：只要快门音或 TTS 正在等待/使用 Speaker，就保持 true。
  * audio_feed_task 仍持续读取 MIC I2S0，避免 RX DMA 堵住，但暂停向 AFE feed()。
+ * speech_detect_task 同期也暂停 fetch()，防止把 AFE ringbuffer 读空。
  */
 static volatile bool s_speaker_playing = false;
 
@@ -764,6 +766,7 @@ static void speech_detect_task(void *arg)
     }
 
     bool command_mode = false;
+    bool speaker_pause_seen = false;
 
     /* 从这一刻开始 Detect Task 已经可以持续 fetch，允许 Feed Task 正式向 AFE 写入。 */
     s_detector_ready = true;
@@ -776,21 +779,47 @@ static void speech_detect_task(void *arg)
     ESP_LOGI(TAG, "====================================================");
 
     while (s_running) {
+        /*
+         * Speaker 播放期间 Feed Task 不会向 AFE feed，所以这里必须同步暂停 fetch。
+         * 否则 Detect Task 会把 AFE 中已有的帧读光，最终得到 ESP_FAIL 并退出。
+         */
+        if (s_speaker_playing) {
+            speaker_pause_seen = true;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        /*
+         * Speaker 刚结束时，先让 audio_feed_task 有一点时间重新向 AFE 填入音频。
+         * 80ms 足够积累数个 16kHz AFE frame，避免恢复瞬间 fetch 到空 ringbuffer。
+         */
+        if (speaker_pause_seen) {
+            vTaskDelay(pdMS_TO_TICKS(AFE_RESUME_GUARD_MS));
+            speaker_pause_seen = false;
+        }
+
         afe_fetch_result_t *result = s_afe_handle->fetch(afe_data);
 
-        if (result == NULL || result->ret_value == ESP_FAIL) {
-            ESP_LOGE(TAG, "AFE fetch failed");
+        if (result == NULL) {
+            ESP_LOGE(TAG, "AFE fetch returned NULL");
             break;
         }
 
         /*
-         * TTS/快门音播放期间，audio_feed_task 已经暂停向 AFE 写入新数据。
-         * 这里再把 AFE 中播放前残留的旧帧直接丢弃，避免：
-         *   1. “你好小智”的尾音被 MultiNet 当成命令；
-         *   2. Speaker 刚开始播放时残留数据进入命令识别；
-         *   3. 设备自己的 TTS 回复参与识别。
+         * ESP_FAIL 在 feed/fetch 恢复的边界上可能只是“暂时还没有完整一帧”，
+         * 不再把它当成致命错误退出识别线程。
+         */
+        if (result->ret_value == ESP_FAIL) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        /*
+         * 极小竞态：可能在上面的 pre-check 之后 Speaker 才开始播放。
+         * 此时丢弃刚 fetch 出来的旧帧，不送入 WakeNet/MultiNet。
          */
         if (s_speaker_playing) {
+            speaker_pause_seen = true;
             continue;
         }
 
@@ -885,6 +914,13 @@ static void speech_detect_task(void *arg)
  * ======================================================================== */
 void app_main(void)
 {
+    /*
+     * Ringbuffer full/empty 属于 AFE 内部的调度 warning；当前应用已经自己处理
+     * feed/fetch 的暂停与恢复，所以不再把这些 warning 刷到串口。
+     * 真正的 AFE error 仍然保留。
+     */
+    esp_log_level_set("AFE", ESP_LOG_ERROR);
+
     ESP_LOGI(TAG, "====================================================");
     ESP_LOGI(TAG, "ESP32-S3 VOICE + CAMERA + WAV + ASYNC ChatTTS + WEB");
     ESP_LOGI(TAG, "Camera   : OV3660 / VGA JPEG / real capture");
