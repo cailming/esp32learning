@@ -1,4 +1,4 @@
-menu "ChatTTS / uplink network"
+menu "Voice services / uplink network"
 
 config TTS_SERVER_URL
     string "ChatTTS streaming URL"
@@ -7,22 +7,40 @@ config TTS_SERVER_URL
         ChatTTS streaming endpoint used by startup prompts, status queries,
         and dialog-mode voice feedback.
 
-        Current verified development server:
-        http://192.168.1.92:8000/tts/stream
+config ASR_SERVER_URL
+    string "FunASR recognition URL"
+    default "http://192.168.1.92:8001/asr"
+    help
+        HTTP endpoint for dialog-mode speech recognition.
+        ESP32 sends application/octet-stream containing 16 kHz, PCM16LE,
+        mono audio and expects JSON such as {"text":"你好"}.
 
-        Set this to an empty string in menuconfig only when you explicitly
-        want to disable TTS playback while keeping the rest of the
-        voice/camera application working normally.
+config ASR_VAD_PEAK_THRESHOLD
+    int "Dialog VAD peak threshold"
+    range 100 10000
+    default 900
+    help
+        Peak amplitude threshold used on ESP32 to decide whether a PCM frame
+        contains speech. Raise it in noisy rooms; lower it if quiet speech is
+        not captured.
+
+config ASR_VAD_SILENCE_MS
+    int "Silence duration that ends one utterance (ms)"
+    range 300 3000
+    default 800
+
+config ASR_MAX_UTTERANCE_MS
+    int "Maximum length of one ASR utterance (ms)"
+    range 2000 15000
+    default 8000
 
 config TTS_WIFI_STA_ENABLE
-    bool "Enable Wi-Fi STA uplink in addition to S3CAM-Photo SoftAP"
+    bool "Enable Wi-Fi STA uplink for TTS / ASR"
     default n
     help
-        Keep the existing S3CAM-Photo SoftAP/web page, and also connect the
-        ESP32 to an existing LAN so it can reach the ChatTTS server.
-
-        This changes Wi-Fi mode from AP to AP+STA. The SoftAP remains available
-        at http://192.168.4.1/.
+        Keep the existing S3CAM-Photo SoftAP/web page and additionally connect
+        the ESP32 to your LAN so it can reach both ChatTTS and FunASR servers.
+        The SoftAP remains available at http://192.168.4.1/.
 
 if TTS_WIFI_STA_ENABLE
 
