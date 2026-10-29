@@ -21,6 +21,7 @@ static const char *TAG = "tts_client";
 #define JSON_BODY_SIZE                 512U
 #define TTS_URL_BUFFER_SIZE            256U
 #define HTTP_TIMEOUT_MS              10000
+#define TTS_SPEECH_SPEED                 3
 
 /*
  * ChatTTS 的 HTTP 响应是 24kHz / mono / PCM16。
@@ -299,7 +300,7 @@ static esp_err_t build_request_json(const char *text,
 {
     static const char prefix[] = "{\"text\":\"";
     static const char suffix[] =
-        "\",\"lang\":\"zh\",\"skip_refine_text\":true}";
+        "\",\"lang\":\"zh\",\"speed\":3,\"skip_refine_text\":true}";
 
     size_t offset = 0;
     if (sizeof(prefix) - 1U + sizeof(suffix) - 1U >= body_size) {
@@ -480,6 +481,7 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
 
     ESP_LOGI(TAG, "POST normalized URL: '%s'", normalized_url);
     ESP_LOGI(TAG, "TTS text: %s", text);
+    ESP_LOGI(TAG, "TTS speech speed: %d (lower = slower)", TTS_SPEECH_SPEED);
 
     esp_http_client_config_t config = {
         .url = normalized_url,
