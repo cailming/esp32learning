@@ -6,6 +6,7 @@
 
 #include "driver/i2s_std.h"
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 #ifdef __cplusplus
