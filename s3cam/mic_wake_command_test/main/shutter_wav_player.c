@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "shutter_wav";
 
@@ -13,9 +14,9 @@ extern const uint8_t shutter_wav_start[] asm("_binary_shutter_wav_start");
 extern const uint8_t shutter_wav_end[]   asm("_binary_shutter_wav_end");
 
 #define SHUTTER_SAMPLE_RATE        44100U
-#define SPEAKER_IDLE_SAMPLE_RATE   16000U
 #define OUTPUT_FRAMES_PER_BLOCK   128U
 #define OUTPUT_GAIN_PERCENT       70
+#define SHUTTER_DMA_DRAIN_MS       30U
 
 static int16_t s_output[OUTPUT_FRAMES_PER_BLOCK * 2U];
 
@@ -152,24 +153,19 @@ static int16_t apply_gain(int32_t sample)
     return (int16_t)sample;
 }
 
-static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
-                                         uint32_t sample_rate)
+static esp_err_t speaker_start_at_sample_rate(i2s_chan_handle_t tx_chan,
+                                              uint32_t sample_rate)
 {
     /*
-     * ChatTTS 播放结束后会把 I2S1 保持 disabled，因此这里允许“已经 disabled”。
+     * 统一约定：TTS 与快门音在播放结束后都把 Speaker I2S 留在 disabled 状态。
+     * 因此这里直接在 disabled 状态下改时钟，不再先调用 disable()。
+     *
+     * 这样既避免“channel has not been enabled yet”的假错误，也能让真正的状态
+     * 管理问题暴露出来：如果某条路径意外把 channel 留在 enabled，reconfig 会失败。
      */
-    esp_err_t err = i2s_channel_disable(tx_chan);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG,
-                 "i2s_channel_disable before %u Hz failed: %s",
-                 (unsigned)sample_rate,
-                 esp_err_to_name(err));
-        return err;
-    }
-
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
 
-    err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
+    esp_err_t err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
                  "reconfig I2S clock to %u Hz failed: %s",
@@ -212,7 +208,7 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
              (unsigned)wav.sample_rate,
              (unsigned)source_samples);
 
-    err = speaker_set_sample_rate(tx_chan, wav.sample_rate);
+    err = speaker_start_at_sample_rate(tx_chan, wav.sample_rate);
     if (err != ESP_OK) {
         return err;
     }
@@ -258,10 +254,29 @@ esp_err_t shutter_wav_play(i2s_chan_handle_t tx_chan)
         source_index += frames;
     }
 
-    esp_err_t restore_err = speaker_set_sample_rate(tx_chan,
-                                                    SPEAKER_IDLE_SAMPLE_RATE);
-    if (err == ESP_OK && restore_err != ESP_OK) {
-        err = restore_err;
+    /*
+     * i2s_channel_write() 返回表示数据已交给 DMA，并不等价于最后一个采样已经从
+     * MAX98357A 播出来。留一个很短的 drain 时间，避免最后的“咔嚓”尾部被截掉。
+     */
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(SHUTTER_DMA_DRAIN_MS));
+    }
+
+    /*
+     * 不再恢复到 16kHz 并保持 enabled。
+     * 快门音结束后明确关闭 Speaker I2S；下一位使用者（通常是“拍照完成”TTS）
+     * 会在 mutex 保护下自行 reconfig 到它需要的 24kHz 再 enable。
+     */
+    esp_err_t stop_err = i2s_channel_disable(tx_chan);
+    if (stop_err != ESP_OK && stop_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG,
+                 "disable Speaker I2S after shutter failed: %s",
+                 esp_err_to_name(stop_err));
+        if (err == ESP_OK) {
+            err = stop_err;
+        }
+    } else {
+        ESP_LOGI(TAG, "Speaker I2S disabled after shutter WAV");
     }
 
     return err;
