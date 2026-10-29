@@ -6,8 +6,12 @@ Endpoints:
 - POST /dialog : raw 16kHz PCM16LE mono -> ASR -> echo processor -> ChatTTS -> raw 24kHz PCM16LE mono
 
 The first dialog version intentionally uses an echo processor: recognized text is
-sent unchanged to ChatTTS.  Later an LLM can be inserted inside
+sent unchanged to ChatTTS. Later an LLM can be inserted inside
 ``dialog_process_text`` without changing the ESP32 transport/playback path.
+
+Control phrases such as "退出对话模式" are not echoed through ChatTTS on the
+server. They are returned to ESP32 in response headers so ESP32 can execute the
+local state transition first and then play its local exit confirmation.
 """
 
 from __future__ import annotations
@@ -56,7 +60,7 @@ ENCODER_CHUNK_LOOK_BACK = 4
 DECODER_CHUNK_LOOK_BACK = 1
 CHUNK_SAMPLES = CHUNK_SIZE[1] * 60 * SAMPLE_RATE // 1000
 
-app = FastAPI(title="ESP32 FunASR Dialog Server", version="2.0")
+app = FastAPI(title="ESP32 FunASR Dialog Server", version="2.1")
 
 _model_lock = threading.Lock()
 _request_ids = itertools.count(1)
@@ -200,8 +204,19 @@ def _recognize_request(pcm: np.ndarray, request_id: int) -> tuple[str, float]:
         return recognize_streaming(pcm, request_id)
 
 
+def _normalize_control_text(text: str) -> str:
+    """Strip whitespace and common sentence-ending punctuation for command matching."""
+    return text.strip().rstrip("。！？!?；;，,").strip()
+
+
+def is_exit_dialog_command(text: str) -> bool:
+    return _normalize_control_text(text) == "退出对话模式"
+
+
 def dialog_process_text(text: str) -> str:
-    """Dialog policy hook. Version 1 simply echoes ASR text back to TTS."""
+    """Dialog policy hook. Control commands are handled locally by ESP32."""
+    if is_exit_dialog_command(text):
+        return ""
     return text.strip()
 
 
@@ -286,7 +301,7 @@ def health() -> dict[str, Any]:
         "chunk_samples": CHUNK_SAMPLES,
         "dialog_tts_url": TTS_SERVER_URL,
         "dialog_tts_sample_rate": TTS_SAMPLE_RATE,
-        "dialog_processor": "echo",
+        "dialog_processor": "echo_with_local_exit_control",
     }
 
 
@@ -328,7 +343,7 @@ async def asr(request: Request) -> dict[str, Any]:
 
 @app.post("/dialog")
 async def dialog(request: Request) -> Response:
-    """ASR -> echo processor -> ChatTTS, returning raw 24k PCM to ESP32."""
+    """ASR -> dialog processor -> ChatTTS, returning raw 24k PCM to ESP32."""
     request_id = next(_request_ids)
     request_started = time.perf_counter()
     client = request.client.host if request.client is not None else "unknown"
@@ -359,6 +374,13 @@ async def dialog(request: Request) -> Response:
         "X-Audio-Channels": "1",
         "X-Dialog-Processor": "echo",
     }
+
+    if is_exit_dialog_command(text):
+        log(
+            f"[DIALOG #{request_id}] exit-dialog control detected -> "
+            "204, ESP32 will exit first then play local confirmation"
+        )
+        return Response(status_code=204, headers=common_headers)
 
     if not reply_text:
         log(f"[DIALOG #{request_id}] empty ASR text -> 204, no TTS")
