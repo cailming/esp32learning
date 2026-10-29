@@ -38,12 +38,13 @@ static const char *TAG = "tts_client";
  *   当前 speech_detect_task = HTTP producer
  *   tts_pcm_play task         = I2S consumer
  *
- * HTTP producer 把 mono PCM 先放入 PSRAM StreamBuffer；达到约 0.5 秒预缓冲后再
- * 启动 I2S consumer。RTX3090 生成速度约 3x realtime，因此后续 producer 应能持续
- * 跑在 consumer 前面，吸收 Wi-Fi/TCP 抖动。
+ * HTTP producer 把 mono PCM 先放入 PSRAM StreamBuffer；现在先积累约 1.0 秒音频
+ * 再启动 I2S consumer。speed=3 后单句音频会明显变长，服务端流式生成速度有时
+ * 不能持续快于实时播放，因此把预缓冲从 0.5 秒提升到 1.0 秒，给 Wi-Fi/TCP/模型
+ * 生成抖动留出更大的安全余量。
  */
-#define TTS_STREAM_STORAGE_BYTES    (48U * 1024U + 1U)
-#define TTS_PREBUFFER_BYTES         24000U  /* 0.5s * 24000Hz * 2 bytes */
+#define TTS_STREAM_STORAGE_BYTES    (96U * 1024U + 1U)
+#define TTS_PREBUFFER_BYTES         48000U  /* 1.0s * 24000Hz * 2 bytes */
 #define TTS_PLAY_TASK_STACK         (6U * 1024U)
 #define TTS_PLAY_TASK_PRIORITY      6
 #define TTS_PLAY_TASK_CORE          1
@@ -79,18 +80,16 @@ typedef struct {
 static esp_err_t speaker_set_sample_rate(i2s_chan_handle_t tx_chan,
                                          uint32_t sample_rate)
 {
-    /* TTS 完成后 channel 保持 disabled；因此 INVALID_STATE 表示本来就停着。 */
-    esp_err_t err = i2s_channel_disable(tx_chan);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG,
-                 "i2s_channel_disable before %u Hz failed: %s",
-                 (unsigned)sample_rate,
-                 esp_err_to_name(err));
-        return err;
-    }
-
+    /*
+     * Speaker channel 在初始化后以及每次 TTS/快门播放结束后都保持 disabled。
+     * 因此这里不再先调用 i2s_channel_disable()；否则“本来就没启用”的正常状态
+     * 也会被 ESP-IDF 打成一条 E 级日志。
+     *
+     * 若未来某条路径真的忘记关闭 channel，下面的 reconfig 会直接失败，反而更
+     * 容易暴露真正的状态管理问题。
+     */
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
-    err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
+    esp_err_t err = i2s_channel_reconfig_std_clock(tx_chan, &clk_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG,
                  "reconfig I2S clock to %u Hz failed: %s",
@@ -393,8 +392,8 @@ static void tts_pcm_play_task(void *arg)
             }
 
             /*
-             * 理论上 0.5 秒预缓冲 + 3090 的 3x realtime 足以避免这里发生。
-             * 若仍发生，不重复旧 DMA 内容，而是主动写一小段静音并计数。
+             * 1.0 秒预缓冲仍可能在极端网络/模型抖动时耗尽。
+             * 若发生，不重复旧 DMA 内容，而是主动写一小段静音并计数。
              */
             ctx->underrun_count++;
             ESP_LOGW(TAG,
@@ -580,8 +579,8 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
     }
 
     /*
-     * 先积累约 0.5 秒 PCM，再启动 I2S。这样第一批模型输出之后即使网络短暂抖动，
-     * consumer 也有足够余量继续播。
+     * 先积累约 1.0 秒 PCM，再启动 I2S。短提示若在达到阈值前已经 EOF，则相当于把
+     * 整段短语音全部缓存后再播放；长播报则至少保留约 1 秒余量。
      */
     bool http_eof = false;
     while (xStreamBufferBytesAvailable(stream) < TTS_PREBUFFER_BYTES) {
@@ -626,9 +625,10 @@ esp_err_t tts_client_play(i2s_chan_handle_t tx_chan,
     }
 
     ESP_LOGI(TAG,
-             "TTS prebuffer ready: %u bytes = %.3fs audio",
+             "TTS prebuffer ready: %u bytes = %.3fs audio%s",
              (unsigned)prebuffer_bytes,
-             prebuffer_bytes / (24000.0 * 2.0));
+             prebuffer_bytes / (24000.0 * 2.0),
+             http_eof ? " (HTTP EOF: full short utterance buffered)" : "");
 
     err = speaker_set_sample_rate(tx_chan, TTS_SAMPLE_RATE);
     if (err != ESP_OK) {
