@@ -129,6 +129,7 @@ static const voice_command_def_t s_commands[] = {
 static bool s_video_recording = false;
 static bool s_sound_enabled = true;
 static volatile bool s_dialog_mode = false;
+static volatile bool s_asr_exit_dialog_requested = false;
 static uint32_t s_photo_success_count = 0;
 
 /* ASR 对话流水线 */
@@ -167,6 +168,18 @@ static const char *command_name_from_id(int command_id)
         if (s_commands[i].command_id == command_id) return s_commands[i].display_name;
     }
     return "未知命令";
+}
+
+static bool is_exit_dialog_text(const char *text)
+{
+    if (text == NULL) return false;
+
+    return strcmp(text, "退出对话模式") == 0 ||
+           strcmp(text, "退出对话模式。") == 0 ||
+           strcmp(text, "退出对话模式！") == 0 ||
+           strcmp(text, "退出对话模式!") == 0 ||
+           strcmp(text, "退出对话模式？") == 0 ||
+           strcmp(text, "退出对话模式?") == 0;
 }
 
 static esp_err_t wait_uplink_ready(uint32_t timeout_ms)
@@ -326,6 +339,7 @@ static bool execute_voice_command(int command_id)
         if (s_dialog_mode) {
             s_dialog_mode = false;
             ESP_LOGI(TAG, "DIALOG MODE -> OFF");
+            ESP_LOGI(TAG, "退出动作已完成，播放退出确认语音");
             queue_tts_text("退出对话模式");
         }
         return true;
@@ -333,6 +347,8 @@ static bool execute_voice_command(int command_id)
     case CMD_EXIT_VOICE:
         if (s_dialog_mode) {
             s_dialog_mode = false;
+            ESP_LOGI(TAG, "DIALOG MODE -> OFF (退出语音)");
+            ESP_LOGI(TAG, "退出动作已完成，播放退出确认语音");
             queue_tts_text("退出对话模式");
         }
         return true;
@@ -567,6 +583,11 @@ static void asr_upload_task(void *arg)
                 ESP_LOGI(TAG, "====================================================");
                 ESP_LOGI(TAG, "ASR TEXT: %s", text);
                 ESP_LOGI(TAG, "====================================================");
+
+                if (s_dialog_mode && is_exit_dialog_text(text)) {
+                    ESP_LOGI(TAG, "ASR CONTROL: 收到退出对话模式，交给本地状态机执行");
+                    s_asr_exit_dialog_requested = true;
+                }
             } else {
                 ESP_LOGI(TAG, "ASR TEXT: (empty)");
             }
@@ -694,6 +715,26 @@ static void speech_detect_task(void *arg)
     ESP_LOGI(TAG, "READY: 你好小智 -> 命令；进入对话模式 -> 任意语音送 FunASR");
 
     while (s_running) {
+        if (s_asr_exit_dialog_requested) {
+            s_asr_exit_dialog_requested = false;
+
+            if (s_dialog_mode) {
+                ESP_LOGI(TAG, "ASR CONTROL: 开始执行退出对话模式");
+                s_dialog_mode = false;
+                multinet->clean(model_data);
+                command_mode = false;
+                s_afe_handle->enable_wakenet(afe_data);
+                if (s_asr_stream != NULL) {
+                    xStreamBufferReset(s_asr_stream);
+                }
+                ESP_LOGI(TAG, "DIALOG MODE -> OFF");
+                ESP_LOGI(TAG, "重新等待唤醒词：你好小智");
+                ESP_LOGI(TAG, "退出动作已完成，播放退出确认语音");
+                queue_tts_text("退出对话模式");
+            }
+            continue;
+        }
+
         if (s_speaker_playing) {
             speaker_pause_seen = true;
             vTaskDelay(pdMS_TO_TICKS(20));
