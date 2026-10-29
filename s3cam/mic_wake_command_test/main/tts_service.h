@@ -30,11 +30,18 @@ esp_err_t tts_service_start(i2s_chan_handle_t tx_chan,
 
 /**
  * @brief 把一条 UTF-8 文本异步投递给 TTS worker。
- *
- * 当前队列长度故意设为 1：设备语音提示是交互反馈，不应该无限堆积旧播报。
- * 如果 Speaker/TTS 已忙，返回 ESP_ERR_INVALID_STATE；队列发送失败返回超时。
  */
 esp_err_t tts_service_enqueue(const char *text);
+
+/**
+ * @brief 取得已经由 tts_service_start() 注册的 Speaker 播放上下文。
+ *
+ * dialog_client 用它复用同一个 I2S TX、Speaker mutex 和 speaker guard，
+ * 从而保证普通 TTS 提示音、快门音和 /dialog 返回语音不会互相抢占。
+ */
+esp_err_t tts_service_get_playback_context(i2s_chan_handle_t *tx_chan,
+                                           SemaphoreHandle_t *speaker_mutex,
+                                           volatile bool **speaker_guard);
 
 #ifdef __cplusplus
 }
