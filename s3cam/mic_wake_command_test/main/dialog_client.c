@@ -52,6 +52,12 @@ typedef struct {
 } dialog_response_headers_t;
 
 /*
+ * stereo 临时输出缓冲不再放到 dialog_pcm_play_task 的 6KB 栈里。
+ * 对话播放同一时刻只会有一个实例，因此使用单个静态缓冲即可。
+ */
+static int16_t s_dialog_stereo_output[(DIALOG_RX_BUFFER_BYTES / 2U + 1U) * 2U];
+
+/*
  * ESP-IDF 6.1 默认不会保存 response headers；
  * esp_http_client_get_response_header() 只有在
  * CONFIG_ESP_HTTP_CLIENT_SAVE_RESPONSE_HEADERS=y 时才会提供。
@@ -171,7 +177,6 @@ static void dialog_pcm_play_task(void *arg)
 {
     dialog_playback_ctx_t *ctx = (dialog_playback_ctx_t *)arg;
     uint8_t pcm[DIALOG_RX_BUFFER_BYTES];
-    int16_t stereo[(DIALOG_RX_BUFFER_BYTES / 2U + 1U) * 2U];
     bool pending_valid = false;
     uint8_t pending_byte = 0;
 
@@ -206,8 +211,8 @@ static void dialog_pcm_play_task(void *arg)
         if (pending_valid && received > 0U) {
             int16_t sample =
                 (int16_t)((uint16_t)pending_byte | ((uint16_t)pcm[0] << 8));
-            stereo[0] = sample;
-            stereo[1] = sample;
+            s_dialog_stereo_output[0] = sample;
+            s_dialog_stereo_output[1] = sample;
             frames = 1;
             index = 1;
             pending_valid = false;
@@ -218,8 +223,8 @@ static void dialog_pcm_play_task(void *arg)
             int16_t sample =
                 (int16_t)((uint16_t)pcm[index] |
                           ((uint16_t)pcm[index + 1U] << 8));
-            stereo[frames * 2U] = sample;
-            stereo[frames * 2U + 1U] = sample;
+            s_dialog_stereo_output[frames * 2U] = sample;
+            s_dialog_stereo_output[frames * 2U + 1U] = sample;
             frames++;
             index += 2U;
             ctx->pcm_bytes_played += 2U;
@@ -232,7 +237,7 @@ static void dialog_pcm_play_task(void *arg)
 
         if (frames > 0U) {
             esp_err_t err = i2s_write_all(ctx->tx_chan,
-                                          (const uint8_t *)stereo,
+                                          (const uint8_t *)s_dialog_stereo_output,
                                           frames * 2U * sizeof(int16_t));
             if (err != ESP_OK) {
                 ctx->consumer_result = err;
@@ -245,6 +250,10 @@ static void dialog_pcm_play_task(void *arg)
         ESP_LOGE(TAG, "Dialog PCM ended with dangling byte");
         ctx->consumer_result = ESP_ERR_INVALID_SIZE;
     }
+
+    ESP_LOGI(TAG,
+             "dialog_pcm_play stack low-water=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     xTaskNotifyGive(ctx->owner_task);
     vTaskDelete(NULL);
@@ -281,6 +290,10 @@ static esp_err_t decode_b64_value(const char *encoded,
 static esp_err_t play_dialog_response_body(esp_http_client_handle_t client,
                                            i2s_chan_handle_t tx_chan)
 {
+    ESP_LOGI(TAG,
+             "Entering dialog PCM receive, caller stack low-water=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
     uint8_t *stream_storage = heap_caps_malloc(DIALOG_STREAM_STORAGE_BYTES,
                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (stream_storage == NULL) {
@@ -419,13 +432,14 @@ cleanup:
     heap_caps_free(stream_storage);
 
     ESP_LOGI(TAG,
-             "Dialog TTS finished: err=%s HTTP=%u PCM=%u audio=%.3fs wall=%.3fs underruns=%lu",
+             "Dialog TTS finished: err=%s HTTP=%u PCM=%u audio=%.3fs wall=%.3fs underruns=%lu stack_low_water=%u",
              esp_err_to_name(err),
              (unsigned)http_bytes,
              (unsigned)playback.pcm_bytes_played,
              playback.pcm_bytes_played / (24000.0 * 2.0),
              (esp_timer_get_time() - started_us) / 1000000.0,
-             (unsigned long)playback.underrun_count);
+             (unsigned long)playback.underrun_count,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return err;
 }
 
@@ -447,21 +461,46 @@ esp_err_t dialog_client_exchange(const char *server_url,
     text[0] = '\0';
     const int content_len = (int)(samples * sizeof(int16_t));
     const double audio_seconds = (double)samples / DIALOG_INPUT_SAMPLE_RATE;
-    dialog_response_headers_t response_headers = {0};
+
+    /*
+     * 这个结构里有约 2KB 的 Base64 header 缓冲。
+     * 不能继续放在 asr_upload_task 的 6KB 栈上，否则进入 PCM 播放路径后很容易
+     * 把任务栈压到危险区。优先放 PSRAM，失败时再退回普通 8-bit heap。
+     */
+    dialog_response_headers_t *response_headers =
+        heap_caps_calloc(1,
+                         sizeof(dialog_response_headers_t),
+                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (response_headers == NULL) {
+        response_headers = heap_caps_calloc(1,
+                                            sizeof(dialog_response_headers_t),
+                                            MALLOC_CAP_8BIT);
+    }
+    if (response_headers == NULL) {
+        ESP_LOGE(TAG, "Cannot allocate dialog response header cache");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG,
+             "DIALOG stack low-water before HTTP=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     esp_http_client_config_t config = {
         .url = server_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = DIALOG_HTTP_TIMEOUT_MS,
         .event_handler = dialog_http_event_handler,
-        .user_data = &response_headers,
+        .user_data = response_headers,
         .buffer_size = DIALOG_RX_BUFFER_BYTES,
         .buffer_size_tx = 2048,
         .keep_alive_enable = false,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) return ESP_ERR_NO_MEM;
+    if (client == NULL) {
+        heap_caps_free(response_headers);
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_http_client_set_header(client, "Content-Type", "application/octet-stream");
     esp_http_client_set_header(client, "X-Sample-Rate", "16000");
@@ -521,7 +560,7 @@ esp_err_t dialog_client_exchange(const char *server_url,
              esp_http_client_is_chunked_response(client) ? "yes" : "no",
              (esp_timer_get_time() - header_started_us) / 1000000.0);
 
-    esp_err_t text_err = decode_b64_value(response_headers.asr_text_b64,
+    esp_err_t text_err = decode_b64_value(response_headers->asr_text_b64,
                                           "X-ASR-Text-B64",
                                           text,
                                           text_size);
@@ -544,8 +583,8 @@ esp_err_t dialog_client_exchange(const char *server_url,
         goto cleanup;
     }
 
-    if (response_headers.sample_rate[0] != '\0') {
-        long sample_rate = strtol(response_headers.sample_rate, NULL, 10);
+    if (response_headers->sample_rate[0] != '\0') {
+        long sample_rate = strtol(response_headers->sample_rate, NULL, 10);
         if (sample_rate != (long)DIALOG_OUTPUT_SAMPLE_RATE) {
             ESP_LOGE(TAG, "Unexpected dialog PCM sample rate: %ld", sample_rate);
             err = ESP_ERR_INVALID_RESPONSE;
@@ -553,10 +592,16 @@ esp_err_t dialog_client_exchange(const char *server_url,
         }
     }
 
+    ESP_LOGI(TAG,
+             "DIALOG before Speaker mutex: stack low-water=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
     if (xSemaphoreTake(speaker_mutex, portMAX_DELAY) != pdTRUE) {
         err = ESP_ERR_INVALID_STATE;
         goto cleanup;
     }
+
+    ESP_LOGI(TAG, "DIALOG Speaker mutex acquired; start PCM response playback");
 
     *speaker_guard = true;
     err = play_dialog_response_body(client, tx_chan);
@@ -567,11 +612,13 @@ esp_err_t dialog_client_exchange(const char *server_url,
 cleanup:
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    heap_caps_free(response_headers);
 
     ESP_LOGI(TAG,
-             "DIALOG HTTP END: err=%s total=%.3fs text=%s",
+             "DIALOG HTTP END: err=%s total=%.3fs text=%s stack_low_water=%u",
              esp_err_to_name(err),
              (esp_timer_get_time() - started_us) / 1000000.0,
-             text[0] != '\0' ? text : "(empty)");
+             text[0] != '\0' ? text : "(empty)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return err;
 }
