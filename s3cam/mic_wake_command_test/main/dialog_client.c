@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
@@ -31,6 +32,8 @@ static const char *TAG = "dialog_client";
 #define DIALOG_TAIL_SILENCE_MS        120U
 #define DIALOG_DMA_DRAIN_GUARD_MS      80U
 #define DIALOG_ACOUSTIC_GUARD_MS      120U
+#define DIALOG_ASR_TEXT_B64_BYTES      2048U
+#define DIALOG_SAMPLE_RATE_HDR_BYTES     16U
 
 typedef struct {
     i2s_chan_handle_t tx_chan;
@@ -42,6 +45,41 @@ typedef struct {
     size_t pcm_bytes_played;
     uint32_t underrun_count;
 } dialog_playback_ctx_t;
+
+typedef struct {
+    char asr_text_b64[DIALOG_ASR_TEXT_B64_BYTES];
+    char sample_rate[DIALOG_SAMPLE_RATE_HDR_BYTES];
+} dialog_response_headers_t;
+
+/*
+ * ESP-IDF 6.1 默认不会保存 response headers；
+ * esp_http_client_get_response_header() 只有在
+ * CONFIG_ESP_HTTP_CLIENT_SAVE_RESPONSE_HEADERS=y 时才会提供。
+ *
+ * 这里直接使用 HTTP_EVENT_ON_HEADER，把本业务需要的两个响应头拷贝出来，
+ * 不依赖全局 SAVE_RESPONSE_HEADERS 配置，也避免额外的 HTTP client 内存开销。
+ */
+static esp_err_t dialog_http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt == NULL || evt->event_id != HTTP_EVENT_ON_HEADER || evt->user_data == NULL ||
+        evt->header_key == NULL || evt->header_value == NULL) {
+        return ESP_OK;
+    }
+
+    dialog_response_headers_t *headers = (dialog_response_headers_t *)evt->user_data;
+
+    if (strcasecmp(evt->header_key, "X-ASR-Text-B64") == 0) {
+        strlcpy(headers->asr_text_b64,
+                evt->header_value,
+                sizeof(headers->asr_text_b64));
+    } else if (strcasecmp(evt->header_key, "X-Audio-Sample-Rate") == 0) {
+        strlcpy(headers->sample_rate,
+                evt->header_value,
+                sizeof(headers->sample_rate));
+    }
+
+    return ESP_OK;
+}
 
 static esp_err_t i2s_write_all(i2s_chan_handle_t tx_chan,
                                const uint8_t *data,
@@ -212,20 +250,17 @@ static void dialog_pcm_play_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static esp_err_t decode_b64_response_header(esp_http_client_handle_t client,
-                                            const char *header_name,
-                                            char *output,
-                                            size_t output_size)
+static esp_err_t decode_b64_value(const char *encoded,
+                                  const char *header_name,
+                                  char *output,
+                                  size_t output_size)
 {
     if (output == NULL || output_size == 0U) return ESP_ERR_INVALID_ARG;
     output[0] = '\0';
 
-    char *encoded = NULL;
-    esp_err_t err = esp_http_client_get_response_header(client, header_name, &encoded);
-    if (err == ESP_ERR_NOT_FOUND || encoded == NULL || encoded[0] == '\0') {
+    if (encoded == NULL || encoded[0] == '\0') {
         return ESP_OK;
     }
-    if (err != ESP_OK) return err;
 
     size_t decoded_len = 0;
     int rc = mbedtls_base64_decode((unsigned char *)output,
@@ -412,11 +447,14 @@ esp_err_t dialog_client_exchange(const char *server_url,
     text[0] = '\0';
     const int content_len = (int)(samples * sizeof(int16_t));
     const double audio_seconds = (double)samples / DIALOG_INPUT_SAMPLE_RATE;
+    dialog_response_headers_t response_headers = {0};
 
     esp_http_client_config_t config = {
         .url = server_url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = DIALOG_HTTP_TIMEOUT_MS,
+        .event_handler = dialog_http_event_handler,
+        .user_data = &response_headers,
         .buffer_size = DIALOG_RX_BUFFER_BYTES,
         .buffer_size_tx = 2048,
         .keep_alive_enable = false,
@@ -477,15 +515,16 @@ esp_err_t dialog_client_exchange(const char *server_url,
 
     int status = esp_http_client_get_status_code(client);
     ESP_LOGI(TAG,
-             "DIALOG HTTP HEADERS: status=%d content_length=%lld wait=%.3fs",
+             "DIALOG HTTP HEADERS: status=%d content_length=%lld chunked=%s wait=%.3fs",
              status,
              (long long)content_length,
+             esp_http_client_is_chunked_response(client) ? "yes" : "no",
              (esp_timer_get_time() - header_started_us) / 1000000.0);
 
-    esp_err_t text_err = decode_b64_response_header(client,
-                                                    "X-ASR-Text-B64",
-                                                    text,
-                                                    text_size);
+    esp_err_t text_err = decode_b64_value(response_headers.asr_text_b64,
+                                          "X-ASR-Text-B64",
+                                          text,
+                                          text_size);
     if (text_err != ESP_OK) {
         ESP_LOGW(TAG, "ASR text header unavailable: %s", esp_err_to_name(text_err));
     }
@@ -505,12 +544,8 @@ esp_err_t dialog_client_exchange(const char *server_url,
         goto cleanup;
     }
 
-    char *sample_rate_header = NULL;
-    if (esp_http_client_get_response_header(client,
-                                            "X-Audio-Sample-Rate",
-                                            &sample_rate_header) == ESP_OK &&
-        sample_rate_header != NULL) {
-        long sample_rate = strtol(sample_rate_header, NULL, 10);
+    if (response_headers.sample_rate[0] != '\0') {
+        long sample_rate = strtol(response_headers.sample_rate, NULL, 10);
         if (sample_rate != (long)DIALOG_OUTPUT_SAMPLE_RATE) {
             ESP_LOGE(TAG, "Unexpected dialog PCM sample rate: %ld", sample_rate);
             err = ESP_ERR_INVALID_RESPONSE;
