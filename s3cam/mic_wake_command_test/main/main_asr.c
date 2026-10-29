@@ -11,6 +11,11 @@
  *                                             -> JSON text -> ESP_LOGI
  *
  * 注意：I2S0 始终只有 audio_feed_task 一个读取者，ASR 只是复制 PCM，避免抢占麦克风。
+ *
+ * 内存策略：
+ *   1. 保持原版已验证的 Camera -> ESP-SR -> Wi-Fi 启动顺序；
+ *   2. 等 Wi-Fi/HTTP Server 成功后，再创建新增的 ASR runtime；
+ *   3. ASR 32KB PCM StreamBuffer 的实际数据区明确放在 PSRAM，避免挤占 Wi-Fi 所需内部 RAM。
  */
 
 #include <assert.h>
@@ -129,11 +134,24 @@ static uint32_t s_photo_success_count = 0;
 /* ASR 对话流水线 */
 static StreamBufferHandle_t s_asr_stream = NULL;
 static QueueHandle_t s_asr_upload_queue = NULL;
+static uint8_t *s_asr_stream_storage = NULL;
+static StaticStreamBuffer_t s_asr_stream_struct;
 
 typedef struct {
     int16_t *pcm;
     size_t samples;
 } asr_utterance_t;
+
+static void log_memory(const char *stage)
+{
+    ESP_LOGI(TAG,
+             "MEM %s: internal=%u largest_internal=%u dma=%u psram=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
 
 static int16_t mic_sample_to_s16(int32_t sample)
 {
@@ -288,8 +306,13 @@ static bool execute_voice_command(int command_id)
     }
 
     case CMD_ENTER_DIALOG_MODE:
+        if (s_asr_stream == NULL || s_asr_upload_queue == NULL) {
+            ESP_LOGE(TAG, "DIALOG MODE unavailable: ASR runtime 未成功启动");
+            queue_tts_text("对话模式暂不可用");
+            return true;
+        }
         if (!s_dialog_mode) {
-            if (s_asr_stream != NULL) xStreamBufferReset(s_asr_stream);
+            xStreamBufferReset(s_asr_stream);
             s_dialog_mode = true;
             ESP_LOGI(TAG, "DIALOG MODE -> ON：开始采集用户语音并发送 ASR");
             queue_tts_text("进入对话模式");
@@ -556,6 +579,68 @@ static void asr_upload_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static esp_err_t start_asr_runtime(void)
+{
+    if (s_asr_stream != NULL && s_asr_upload_queue != NULL) return ESP_OK;
+
+    log_memory("before ASR runtime");
+
+    /*
+     * xStreamBufferCreate() 默认通过 FreeRTOS heap 申请数据区，容易占用内部 RAM。
+     * 这里显式把 32KB PCM 环形缓冲区放进 8MB PSRAM，只把很小的控制块留在内部 RAM。
+     */
+    s_asr_stream_storage = heap_caps_malloc(ASR_STREAM_BYTES,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_asr_stream_storage == NULL) {
+        ESP_LOGE(TAG, "ASR PSRAM stream storage malloc failed (%u bytes)",
+                 (unsigned)ASR_STREAM_BYTES);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_asr_stream = xStreamBufferCreateStatic(ASR_STREAM_BYTES,
+                                             1,
+                                             s_asr_stream_storage,
+                                             &s_asr_stream_struct);
+    if (s_asr_stream == NULL) {
+        ESP_LOGE(TAG, "ASR static StreamBuffer create failed");
+        heap_caps_free(s_asr_stream_storage);
+        s_asr_stream_storage = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_asr_upload_queue = xQueueCreate(ASR_UPLOAD_QUEUE_DEPTH, sizeof(asr_utterance_t));
+    if (s_asr_upload_queue == NULL) {
+        ESP_LOGE(TAG, "ASR upload queue create failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t capture_ok = xTaskCreatePinnedToCore(dialog_capture_task,
+                                                    "dialog_capture",
+                                                    4 * 1024,
+                                                    NULL,
+                                                    4,
+                                                    NULL,
+                                                    0);
+    BaseType_t upload_ok = xTaskCreatePinnedToCore(asr_upload_task,
+                                                   "asr_upload",
+                                                   6 * 1024,
+                                                   NULL,
+                                                   3,
+                                                   NULL,
+                                                   0);
+    if (capture_ok != pdPASS || upload_ok != pdPASS) {
+        ESP_LOGE(TAG,
+                 "Create ASR tasks failed: capture=%ld upload=%ld",
+                 (long)capture_ok,
+                 (long)upload_ok);
+        return ESP_ERR_NO_MEM;
+    }
+
+    log_memory("after ASR runtime");
+    ESP_LOGI(TAG, "ASR runtime ready: 32KB PCM stream in PSRAM");
+    return ESP_OK;
+}
+
 static esp_err_t configure_multinet_commands(void)
 {
     ESP_RETURN_ON_ERROR(esp_mn_commands_clear(), TAG, "clear commands");
@@ -706,6 +791,8 @@ void app_main(void)
     ESP_LOGI(TAG, "ASR: %s", strlen(CONFIG_ASR_SERVER_URL) ? CONFIG_ASR_SERVER_URL : "(not configured)");
     ESP_LOGI(TAG, "====================================================");
 
+    log_memory("boot");
+
     ESP_ERROR_CHECK(camera_capture_init());
     ESP_ERROR_CHECK(init_mic_i2s());
     ESP_ERROR_CHECK(init_speaker_i2s());
@@ -715,26 +802,33 @@ void app_main(void)
                                       s_speaker_mutex,
                                       &s_speaker_playing));
 
-    s_asr_stream = xStreamBufferCreate(ASR_STREAM_BYTES, 1);
-    s_asr_upload_queue = xQueueCreate(ASR_UPLOAD_QUEUE_DEPTH, sizeof(asr_utterance_t));
-    if (s_asr_stream == NULL || s_asr_upload_queue == NULL) {
-        ESP_LOGE(TAG, "Create ASR stream/queue failed");
+    /*
+     * 先完全恢复旧版已经验证过的 ESP-SR 启动路径。
+     * 新增 ASR StreamBuffer/Queue/Task 暂时不创建，避免在 esp_wifi_init() 前抢内部 RAM。
+     */
+    s_models = esp_srmodel_init("model");
+    if (s_models == NULL) {
+        ESP_LOGE(TAG, "esp_srmodel_init(model) failed");
         return;
     }
 
-    s_models = esp_srmodel_init("model");
-    if (s_models == NULL) return;
-
     afe_config_t *afe_cfg = afe_config_init("M", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
-    if (afe_cfg == NULL) return;
+    if (afe_cfg == NULL) {
+        ESP_LOGE(TAG, "afe_config_init failed");
+        return;
+    }
     s_afe_handle = esp_afe_handle_from_config(afe_cfg);
     if (s_afe_handle == NULL) {
         afe_config_free(afe_cfg);
+        ESP_LOGE(TAG, "esp_afe_handle_from_config failed");
         return;
     }
     s_afe_data = s_afe_handle->create_from_config(afe_cfg);
     afe_config_free(afe_cfg);
-    if (s_afe_data == NULL) return;
+    if (s_afe_data == NULL) {
+        ESP_LOGE(TAG, "AFE create_from_config failed");
+        return;
+    }
 
     BaseType_t feed_ok = xTaskCreatePinnedToCore(audio_feed_task,
                                                  "audio_feed",
@@ -750,27 +844,37 @@ void app_main(void)
                                                    5,
                                                    NULL,
                                                    1);
-    BaseType_t capture_ok = xTaskCreatePinnedToCore(dialog_capture_task,
-                                                    "dialog_capture",
-                                                    5 * 1024,
-                                                    NULL,
-                                                    4,
-                                                    NULL,
-                                                    0);
-    BaseType_t upload_ok = xTaskCreatePinnedToCore(asr_upload_task,
-                                                   "asr_upload",
-                                                   7 * 1024,
-                                                   NULL,
-                                                   3,
-                                                   NULL,
-                                                   0);
-    if (feed_ok != pdPASS || detect_ok != pdPASS || capture_ok != pdPASS || upload_ok != pdPASS) {
-        ESP_LOGE(TAG, "Create speech/ASR task failed");
+    if (feed_ok != pdPASS || detect_ok != pdPASS) {
+        ESP_LOGE(TAG, "Create speech task failed");
         s_running = false;
         return;
     }
 
-    ESP_ERROR_CHECK(photo_http_server_start());
+    log_memory("before Wi-Fi");
+
+    /*
+     * 关键：Wi-Fi 必须在新增 ASR runtime 之前先拿到它需要的内部 DMA/RX buffer。
+     * 不再 ESP_ERROR_CHECK，避免内存异常时进入无限重启循环，保留完整错误日志。
+     */
+    esp_err_t photo_err = photo_http_server_start();
+    if (photo_err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "photo_http_server_start failed: %s (0x%x). Stop boot instead of reboot loop.",
+                 esp_err_to_name(photo_err),
+                 (unsigned)photo_err);
+        log_memory("Wi-Fi FAILED");
+        return;
+    }
+
+    log_memory("after Wi-Fi");
+
+    /* Wi-Fi 成功以后才追加 ASR runtime。失败时保留原有 WakeNet/Camera/TTS 功能。 */
+    esp_err_t asr_runtime_err = start_asr_runtime();
+    if (asr_runtime_err != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "ASR runtime disabled because memory allocation failed: %s",
+                 esp_err_to_name(asr_runtime_err));
+    }
 
     esp_err_t uplink = ESP_OK;
     if (strlen(CONFIG_TTS_SERVER_URL) > 0U || strlen(CONFIG_ASR_SERVER_URL) > 0U) {
